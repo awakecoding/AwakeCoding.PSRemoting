@@ -1,0 +1,30 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.002.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{19FD14AD-3D92-4A29-8825-D7359AC37169}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "AwakeCoding.PSRemoting.PowerShell", "src\AwakeCoding.PSRemoting.PowerShell.csproj", "{3D9338E1-3082-46F6-B95F-BBAE73229985}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{3D9338E1-3082-46F6-B95F-BBAE73229985}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3D9338E1-3082-46F6-B95F-BBAE73229985}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3D9338E1-3082-46F6-B95F-BBAE73229985}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3D9338E1-3082-46F6-B95F-BBAE73229985}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{3D9338E1-3082-46F6-B95F-BBAE73229985} = {19FD14AD-3D92-4A29-8825-D7359AC37169}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {8AA3AE5C-F059-4026-BD3B-D3365215592C}
+	EndGlobalSection
+EndGlobal

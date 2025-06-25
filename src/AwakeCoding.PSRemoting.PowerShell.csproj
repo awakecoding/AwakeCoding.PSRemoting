@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>AwakeCoding.PSRemoting.PowerShell</RootNamespace>
+    <AssemblyName>AwakeCoding.PSRemoting.PowerShell</AssemblyName>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <TargetFrameworks>net9.0</TargetFrameworks>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Management.Automation" Version="7.*" />
+    <Reference Include="System.Management.Automation">
+      <HintPath>.\Ref\System.Management.Automation.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>
