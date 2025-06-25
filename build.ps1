@@ -1,4 +1,6 @@
 
 dotnet build -c Release -f net9.0
 
-Copy-Item "$PSScriptRoot\src\bin\Release\net9.0\AwakeCoding.PSRemoting.PowerShell.dll" "$PSScriptRoot\AwakeCoding.PSRemoting\AwakeCoding.PSRemoting.PowerShell.dll" -Force
+$OutputPath = "$PSScriptRoot\src\bin\Release\net9.0"
+$ModulePath = "$PSScriptRoot\AwakeCoding.PSRemoting"
+Copy-Item "$OutputPath\AwakeCoding.PSRemoting.PowerShell.dll" "$ModulePath\AwakeCoding.PSRemoting.PowerShell.dll" -Force

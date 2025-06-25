@@ -53,34 +53,6 @@ namespace AwakeCoding.PSRemoting.PowerShell
             return connectionInfo;
         }
 
-        public static string? GetPwshPath()
-        {
-            string? currentExePath = Environment.ProcessPath;
-
-            if (currentExePath != null && Path.GetFileName(currentExePath).Contains("pwsh", StringComparison.OrdinalIgnoreCase))
-            {
-                return currentExePath;
-            }
-
-            string pwshExecutableName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "pwsh.exe" : "pwsh";
-
-            string[]? paths = Environment.GetEnvironmentVariable("PATH")?.Split(Path.PathSeparator);
-
-            if (paths == null)
-                return null;
-
-            foreach (string path in paths)
-            {
-                string fullPath = Path.Combine(path, pwshExecutableName);
-                if (File.Exists(fullPath))
-                {
-                    return fullPath;
-                }
-            }
-
-            return null;
-        }
-
         public override BaseClientSessionTransportManager CreateClientSessionTransportManager(
             Guid instanceId,
             string sessionName,
@@ -171,15 +143,40 @@ namespace AwakeCoding.PSRemoting.PowerShell
         private Runspace? _runspace;
         private ManualResetEvent? _openAsync;
 
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        public string? ExecutablePath { get; set; }
+
+        [Parameter()]
+        public SwitchParameter UseWindowsPowerShell { get; set; }
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        public string RunspaceName { get; set; } = "PSHostClient";
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        public string TransportName { get; set; } = "PSHostSession";
+
         protected override void BeginProcessing()
         {
             string computerName = "localhost";
-            string? executable = PSHostClientInfo.GetPwshPath();
             string arguments = "-NoLogo -NoProfile -s";
 
-            if (executable == null)
+            string? executable;
+
+            if (!string.IsNullOrWhiteSpace(ExecutablePath))
             {
-                throw new InvalidOperationException("The pwsh executable path could not be found.");
+                executable = ExecutablePath;
+            }
+            else
+            {
+                executable = PowerShellFinder.GetExecutablePath(UseWindowsPowerShell);
+            }
+
+            if (executable == null || !File.Exists(executable))
+            {
+                throw new InvalidOperationException("The PowerShell executable path could not be found");
             }
 
             _connectionInfo = new PSHostClientInfo(computerName, executable, arguments);
@@ -189,7 +186,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 host: Host,
                 typeTable: TypeTable.LoadDefaultTypeFiles(),
                 applicationArguments: null,
-                name: "PSHostClient");
+                name: RunspaceName);
 
             _openAsync = new ManualResetEvent(false);
             _runspace.StateChanged += HandleRunspaceStateChanged;
@@ -202,7 +199,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 WriteObject(
                     PSSession.Create(
                         runspace: _runspace,
-                        transportName: "PSHostSession",
+                        transportName: TransportName,
                         psCmdlet: this));
             }
             finally

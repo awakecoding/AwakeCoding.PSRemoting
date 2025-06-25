@@ -8,7 +8,7 @@
 RootModule = 'AwakeCoding.PSRemoting.PowerShell.dll'
 
 # Version number of this module.
-ModuleVersion = '2025.1.0'
+ModuleVersion = '2025.1.1'
 
 # Supported PSEditions
 CompatiblePSEditions = @('Core')
@@ -29,7 +29,7 @@ Author = 'Marc-André Moreau'
 Description = 'AwakeCoding PSRemoting Extensions'
 
 # Minimum version of the PowerShell engine required by this module
-PowerShellVersion = '7.4'
+PowerShellVersion = '7.2'
 
 # Name of the PowerShell host required by this module
 # PowerShellHostName = ''

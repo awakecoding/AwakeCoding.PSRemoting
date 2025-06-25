@@ -45,6 +45,66 @@ PSSession objects are persistent, here is how you can list and cleanup the ones 
 Get-PSSession | Where-Object { $_.Name -eq 'PSHostClient' } | Remove-PSSession
 ```
 
+## Windows PowerShell Compatibility
+
+By default, `New-PSHostSession` starts PowerShell 7 (pwsh). To launch a session using Windows PowerShell instead, use the `-UseWindowsPowerShell` switch:
+
+```powershell
+PS > New-PSHostSession -UseWindowsPowerShell | Enter-PSSession
+[localhost]: PS > $PSVersionTable
+
+Name                           Value
+----                           -----
+PSVersion                      5.1.26100.4202
+PSEdition                      Desktop
+PSCompatibleVersions           {1.0, 2.0, 3.0, 4.0...}
+BuildVersion                   10.0.26100.4202
+CLRVersion                     4.0.30319.42000
+WSManStackVersion              3.0
+PSRemotingProtocolVersion      2.3
+SerializationVersion           1.1.0.1
+```
+
+For obvious reasons, this is only supported on Windows. You may have heard that PowerShell 7 can load Windows PowerShell modules through a [special compatibility layer](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_windows_powershell_compatibility), like this:
+
+```powershell
+PS > Import-Module ScheduledTasks -UseWindowsPowerShell
+WARNING: Module ScheduledTasks is loaded in Windows PowerShell using WinPSCompatSession remoting session; please note that all input and output of commands from this module will be deserialized objects. If you want to load this module into PowerShell please use 'Import-Module -SkipEditionCheck' syntax.
+```
+
+You can achieve the same result manually by using the [Import-Module](https://learn.microsoft.com/en-us/powershell/scripting/developer/module/importing-a-powershell-module) `-PSSession` parameter:
+
+```powershell
+PS > $WinPSSession = New-PSHostSession -UseWindowsPowerShell
+Import-Module -Name ScheduledTasks -PSSession $WinPSSession
+```
+
+Just like the built-in Windows compatibility, this results in automatic proxy functions created for the entire PowerShell module, such that when you call the cmdlets in the client process, they get executed through PSRemoting in a Windows PowerShell subprocess.
+
+## Explicit PowerShell Path
+
+The `New-PSHostSession` cmdlet finds the first PowerShell executable in the PATH, unless the parent executable is PowerShell, in which case it will use the same one. If you wish to launch a specific version of PowerShell, just specify the explicit executable path:
+
+```powershell
+PS > $PSSession = New-PSHostSession -ExecutablePath 'C:\PowerShell-7.2.11-win-x64\pwsh.exe'
+PS > $PSSession | Enter-PSSession
+[localhost]: PS > $PSVersionTable
+
+Name                           Value
+----                           -----
+PSVersion                      7.2.11
+PSEdition                      Core
+GitCommitId                    7.2.11
+OS                             Microsoft Windows 10.0.26100
+Platform                       Win32NT
+PSCompatibleVersions           {1.0, 2.0, 3.0, 4.0…}
+PSRemotingProtocolVersion      2.3
+SerializationVersion           1.1.0.1
+WSManStackVersion              3.0
+```
+
+This can be useful to have a script running using the latest PowerShell that can drive executions in multiple older versions of PowerShell through local PSRemoting.
+
 ## How does New-PSHostSession work?
 
 So, what does `New-PSHostSession` even do? It creates a PowerShell subprocess in *server mode*, meaning it will expect the [PSRemoting protocol](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp/58ff7ff6-8078-45e2-a6ff-d496e188c39a) over standard input/output instead the regular command-line interface. The cmdlet then does the internal plumbing to connect the PSRemoting client to the standard input/output streams of the subprocess, the same way it would be done for [named pipe transports](https://awakecoding.com/posts/powershell-host-ipc-for-any-dotnet-application/).
