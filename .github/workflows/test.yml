@@ -1,0 +1,94 @@
+name: Test PowerShell Module
+
+on:
+  push:
+    branches: [ main, master, test-workflow ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        
+    runs-on: ${{ matrix.os }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '9.0.x'
+        
+    - name: Setup PowerShell Core
+      uses: mchave3/setup-pwsh@v1.0.0
+      with:
+        version: 'latest'
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Setup PowerShell
+      shell: pwsh
+      run: |
+        Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)"
+        Write-Host "OS: $($PSVersionTable.OS)"
+        Write-Host "Platform: $($PSVersionTable.Platform)"
+        
+    - name: Install Pester
+      shell: pwsh
+      run: |
+        if (Get-Module -ListAvailable -Name Pester | Where-Object Version -ge 5.0.0) {
+          Write-Host "Pester 5.x is already installed"
+        } else {
+          Write-Host "Installing Pester 5.x"
+          Install-Module -Name Pester -MinimumVersion 5.0.0 -Force -SkipPublisherCheck -Scope CurrentUser
+        }
+        Import-Module Pester -MinimumVersion 5.0.0
+        Get-Module Pester
+        
+    - name: Build module
+      shell: pwsh
+      run: |
+        Write-Host "Building module..."
+        dotnet build -c Release -f net9.0
+        
+        # Copy DLL to module folder
+        $OutputPath = Join-Path $env:GITHUB_WORKSPACE 'src\bin\Release\net9.0'
+        $ModulePath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting'
+        
+        Write-Host "Output path: $OutputPath"
+        Write-Host "Module path: $ModulePath"
+        
+        $dllPath = Join-Path $OutputPath 'AwakeCoding.PSRemoting.PowerShell.dll'
+        if (Test-Path $dllPath) {
+          Copy-Item $dllPath -Destination (Join-Path $ModulePath 'AwakeCoding.PSRemoting.PowerShell.dll') -Force
+          Write-Host "DLL copied successfully"
+        } else {
+          Write-Error "DLL not found at: $dllPath"
+          exit 1
+        }
+        
+    - name: Run Pester tests
+      shell: pwsh
+      run: |
+        $config = New-PesterConfiguration
+        $config.Run.Path = './tests'
+        $config.Run.Exit = $true
+        $config.CodeCoverage.Enabled = $false
+        $config.TestResult.Enabled = $true
+        $config.TestResult.OutputPath = 'testResults.xml'
+        $config.TestResult.OutputFormat = 'NUnitXml'
+        $config.Output.Verbosity = 'Detailed'
+        
+        Invoke-Pester -Configuration $config
+        
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results-${{ matrix.os }}
+        path: testResults.xml
