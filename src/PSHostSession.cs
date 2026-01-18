@@ -125,11 +125,19 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             if (_process != null)
             {
-                if (!_process.HasExited)
+                try
                 {
-                    _process.Kill();
+                    if (!_process.HasExited)
+                    {
+                        _process.Kill();
+                        _process.WaitForExit(500);
+                    }
                 }
-                _process.Dispose();
+                catch { }
+                finally
+                {
+                    _process?.Dispose();
+                }
             }
             _process = null;
         }
