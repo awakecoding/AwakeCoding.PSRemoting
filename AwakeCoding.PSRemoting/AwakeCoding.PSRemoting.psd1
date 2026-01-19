@@ -8,7 +8,7 @@
 RootModule = 'AwakeCoding.PSRemoting.PowerShell.dll'
 
 # Version number of this module.
-ModuleVersion = '2025.1.1'
+ModuleVersion = '2026.1.0'
 
 # Supported PSEditions
 CompatiblePSEditions = @('Core')
@@ -68,7 +68,7 @@ PowerShellVersion = '7.2'
 FunctionsToExport = @()
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
-CmdletsToExport = @('New-PSHostSession')
+CmdletsToExport = @('New-PSHostSession', 'Connect-PSHostProcess')
 
 # Variables to export from this module
 VariablesToExport = @()
