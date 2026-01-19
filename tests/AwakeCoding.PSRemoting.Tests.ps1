@@ -40,13 +40,27 @@ BeforeAll {
                 }
             }
             if ($session) {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
             Start-Sleep -Milliseconds $RetryDelayMs
         }
         
         # Return last attempt even if failed - let the test handle the error
         return $session
+    }
+
+    function script:Remove-PSHostSessionSafely {
+        param(
+            [System.Management.Automation.Runspaces.PSSession]$Session
+        )
+
+        if ($null -ne $Session) {
+            try {
+                Remove-PSSession -Session $Session -ErrorAction SilentlyContinue
+            }
+            catch {
+            }
+        }
     }
 }
 
@@ -101,7 +115,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
                 $result | Should -Be 2
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
 
@@ -114,7 +128,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
                 $result | Should -Be 4
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
     }
@@ -130,7 +144,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
                 $result | Should -Be 15
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
 
@@ -146,7 +160,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
                 $version | Should -BeGreaterOrEqual 7
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
     }
@@ -163,7 +177,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
                 $edition | Should -Be 'Desktop'
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
 
@@ -174,7 +188,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
                 $version | Should -Be 5
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
     }
@@ -197,7 +211,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
                 $result | Should -Be 'Microsoft.PowerShell.Management'
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
 
@@ -223,7 +237,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
                 $result | Should -Match 'pwsh|powershell'
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
     }
@@ -297,7 +311,7 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
                     }
 
                     if ($session) {
-                        $session | Remove-PSSession -ErrorAction SilentlyContinue
+                        Remove-PSHostSessionSafely -Session $session
                     }
 
                     Start-Sleep -Milliseconds $RetryDelayMilliseconds
@@ -365,7 +379,7 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
                 $result | Should -Be 4
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
 
@@ -387,7 +401,7 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
                 $version | Should -BeGreaterOrEqual 7
             }
             finally {
-                $session | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session
             }
         }
 
@@ -400,11 +414,11 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
                     # It may be 'Broken' or 'Opening' (timed out during connection)
                     $session2.State | Should -Not -Be 'Opened'
                 } finally {
-                    $session2 | Remove-PSSession -ErrorAction SilentlyContinue
+                    Remove-PSHostSessionSafely -Session $session2
                 }
             }
             finally {
-                $session1 | Remove-PSSession -ErrorAction SilentlyContinue
+                Remove-PSHostSessionSafely -Session $session1
             }
         }
     }

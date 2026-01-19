@@ -1,3 +1,5 @@
+#if false
+// Deprecated: types moved to PSHostSessionCommands.cs and Transports/*
 using System;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
@@ -675,3 +677,4 @@ namespace AwakeCoding.PSRemoting.PowerShell
         }
     }
 }
+#endif
