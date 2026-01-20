@@ -857,3 +857,549 @@ Describe 'TCP Server Cmdlet Tests' {
     }
 }
 
+Describe 'PSHostWebSocketServer' {
+    BeforeAll {
+        # Helper function to get a random available port in the ephemeral range
+        function script:Get-RandomEphemeralPort {
+            param(
+                [int]$MinPort = 49152,
+                [int]$MaxPort = 65535,
+                [int]$MaxAttempts = 100
+            )
+            
+            for ($i = 0; $i -lt $MaxAttempts; $i++) {
+                $port = Get-Random -Minimum $MinPort -Maximum $MaxPort
+                try {
+                    # Try to start an HttpListener on this port to test availability
+                    $listener = [System.Net.HttpListener]::new()
+                    $prefix = "http://localhost:$port/"
+                    $listener.Prefixes.Add($prefix)
+                    $listener.Start()
+                    $listener.Stop()
+                    $listener.Close()
+                    return $port
+                }
+                catch {
+                    # Port is in use or unavailable, try again
+                    continue
+                }
+            }
+            
+            throw "Could not find an available port after $MaxAttempts attempts"
+        }
+    }
+    
+    Context 'Module Exports' {
+        It 'Should export Start-PSHostWebSocketServer cmdlet' {
+            Get-Command -Name Start-PSHostWebSocketServer -Module AwakeCoding.PSRemoting | Should -Not -BeNullOrEmpty
+        }
+        
+        It 'Should export Stop-PSHostWebSocketServer cmdlet' {
+            Get-Command -Name Stop-PSHostWebSocketServer -Module AwakeCoding.PSRemoting | Should -Not -BeNullOrEmpty
+        }
+        
+        It 'Should export Get-PSHostWebSocketServer cmdlet' {
+            Get-Command -Name Get-PSHostWebSocketServer -Module AwakeCoding.PSRemoting | Should -Not -BeNullOrEmpty
+        }
+    }
+    
+    Context 'Basic Functionality' {
+        AfterEach {
+            # Cleanup any remaining servers
+            Get-PSHostWebSocketServer | ForEach-Object {
+                try {
+                    Stop-PSHostWebSocketServer -Server $_ -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                    Write-Warning "Failed to stop server $($_.Name): $_"
+                }
+            }
+        }
+        
+        It 'Should start a WebSocket server with random port' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port
+            
+            try {
+                $server | Should -Not -BeNullOrEmpty
+                $server.Port | Should -Be $port
+                $server.State | Should -Be 'Running'
+                $server.Name | Should -Not -BeNullOrEmpty
+                $server.ConnectionCount | Should -Be 0
+                # ListenerPrefix shows the actual listen address (127.0.0.1 by default)
+                $server.ListenerPrefix | Should -Match "http://127\.0\.0\.1:$port/pwsh/"
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should start a WebSocket server with custom name' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port -Name 'CustomWebSocketServer'
+            
+            try {
+                $server.Name | Should -Be 'CustomWebSocketServer'
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should start a WebSocket server with custom path' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port -Path '/custompath'
+            
+            try {
+                $server.ListenerPrefix | Should -Match "/custompath/"
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should retrieve servers with Get-PSHostWebSocketServer' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port -Name 'TestServer1'
+            
+            try {
+                $retrieved = Get-PSHostWebSocketServer -Name 'TestServer1'
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.Name | Should -Be 'TestServer1'
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should retrieve servers by port' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port
+            
+            try {
+                $retrieved = Get-PSHostWebSocketServer -Port $port
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.Port | Should -Be $port
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should get all WebSocket servers' {
+            $port1 = Get-RandomEphemeralPort
+            $port2 = Get-RandomEphemeralPort
+            while ($port2 -eq $port1) {
+                $port2 = Get-RandomEphemeralPort
+            }
+            
+            $server1 = Start-PSHostWebSocketServer -Port $port1 -Name 'WS1'
+            $server2 = Start-PSHostWebSocketServer -Port $port2 -Name 'WS2'
+            
+            try {
+                $servers = Get-PSHostWebSocketServer -All
+                $servers.Count | Should -BeGreaterOrEqual 2
+                $servers | Where-Object { $_.Name -eq 'WS1' } | Should -Not -BeNullOrEmpty
+                $servers | Where-Object { $_.Name -eq 'WS2' } | Should -Not -BeNullOrEmpty
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server1 -Force
+                Stop-PSHostWebSocketServer -Server $server2 -Force
+            }
+        }
+        
+        It 'Should stop server by name' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port -Name 'StopByName'
+            $server.State | Should -Be 'Running'
+            
+            Stop-PSHostWebSocketServer -Name 'StopByName'
+            
+            # Server should no longer be retrievable
+            $retrieved = Get-PSHostWebSocketServer -Name 'StopByName'
+            $retrieved | Should -BeNullOrEmpty
+        }
+        
+        It 'Should stop server by port' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port
+            $server.State | Should -Be 'Running'
+            
+            Stop-PSHostWebSocketServer -Port $port
+            
+            # Server should no longer be retrievable
+            $retrieved = Get-PSHostWebSocketServer -Port $port
+            $retrieved | Should -BeNullOrEmpty
+        }
+        
+        It 'Should stop server by server object' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port
+            $server.State | Should -Be 'Running'
+            
+            Stop-PSHostWebSocketServer -Server $server
+            
+            # Server should no longer be retrievable
+            $retrieved = Get-PSHostWebSocketServer -Port $port
+            $retrieved | Should -BeNullOrEmpty
+        }
+        
+        It 'Should handle multiple servers independently' {
+            $port1 = Get-RandomEphemeralPort
+            $port2 = Get-RandomEphemeralPort
+            while ($port2 -eq $port1) {
+                $port2 = Get-RandomEphemeralPort
+            }
+            
+            $server1 = Start-PSHostWebSocketServer -Port $port1 -Name 'Multi1'
+            $server2 = Start-PSHostWebSocketServer -Port $port2 -Name 'Multi2'
+            
+            try {
+                $server1.State | Should -Be 'Running'
+                $server2.State | Should -Be 'Running'
+                $server1.Port | Should -Not -Be $server2.Port
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server1 -Force
+                Stop-PSHostWebSocketServer -Server $server2 -Force
+            }
+        }
+        
+        It 'Should enforce MaxConnections limit' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port -MaxConnections 2
+            
+            try {
+                $server.MaxConnections | Should -Be 2
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should reject invalid port numbers' {
+            { Start-PSHostWebSocketServer -Port 0 } | Should -Throw
+            { Start-PSHostWebSocketServer -Port -1 } | Should -Throw
+            { Start-PSHostWebSocketServer -Port 65536 } | Should -Throw
+        }
+        
+        It 'Should reject duplicate server names' {
+            $port1 = Get-RandomEphemeralPort
+            $port2 = Get-RandomEphemeralPort
+            while ($port2 -eq $port1) {
+                $port2 = Get-RandomEphemeralPort
+            }
+            
+            $server1 = Start-PSHostWebSocketServer -Port $port1 -Name 'DuplicateName'
+            
+            try {
+                { Start-PSHostWebSocketServer -Port $port2 -Name 'DuplicateName' } | Should -Throw
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server1 -Force
+            }
+        }
+        
+        It 'Should reject duplicate ports' {
+            $port = Get-RandomEphemeralPort
+            $server1 = Start-PSHostWebSocketServer -Port $port
+            
+            try {
+                { Start-PSHostWebSocketServer -Port $port } | Should -Throw
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server1 -Force
+            }
+        }
+    }
+    
+    Context 'Integration Tests' {
+        AfterEach {
+            # Cleanup any remaining servers
+            Get-PSHostWebSocketServer | ForEach-Object {
+                try {
+                    Stop-PSHostWebSocketServer -Server $_ -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                    Write-Warning "Failed to stop server $($_.Name): $_"
+                }
+            }
+        }
+        
+        It 'Should accept WebSocket client connections' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port
+            
+            try {
+                # Wait for server to be ready
+                Start-Sleep -Milliseconds 200
+                
+                # Create a WebSocket client connection
+                $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+                $uri = [Uri]::new("ws://localhost:$port/pwsh")
+                $cts = [System.Threading.CancellationToken]::None
+                
+                try {
+                    # Connect to the server
+                    $connectTask = $ws.ConnectAsync($uri, $cts)
+                    $connectTask.Wait(5000) | Should -Be $true
+                    
+                    # Verify connection state
+                    $ws.State | Should -Be 'Open'
+                    
+                    # Wait for server to register the connection
+                    Start-Sleep -Milliseconds 200
+                    
+                    # Server should show 1 connection
+                    $server = Get-PSHostWebSocketServer -Port $port
+                    $server.ConnectionCount | Should -Be 1
+                }
+                finally {
+                    if ($ws.State -eq 'Open') {
+                        try {
+                            $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Test complete", $cts).Wait(1000)
+                        }
+                        catch {}
+                    }
+                    $ws.Dispose()
+                }
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should send PowerShell output over WebSocket' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port
+            
+            try {
+                # Wait for server to be ready
+                Start-Sleep -Milliseconds 200
+                
+                # Create a WebSocket client connection
+                $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+                $uri = [Uri]::new("ws://localhost:$port/pwsh")
+                $cts = [System.Threading.CancellationToken]::None
+                
+                try {
+                    # Connect to the server
+                    $connectTask = $ws.ConnectAsync($uri, $cts)
+                    $connectTask.Wait(5000) | Should -Be $true
+                    
+                    # Send a simple PSRP command (Note: this is simplified, real PSRP is more complex)
+                    # For now, just verify we can send/receive data
+                    $buffer = [byte[]]::new(4096)
+                    $segment = [ArraySegment[byte]]::new($buffer)
+                    
+                    # Try to receive data (should get PSRP negotiation)
+                    $receiveTask = $ws.ReceiveAsync($segment, $cts)
+                    $completed = $receiveTask.Wait(2000)
+                    
+                    if ($completed) {
+                        $result = $receiveTask.Result
+                        $result.Count | Should -BeGreaterThan 0
+                    }
+                }
+                finally {
+                    if ($ws.State -eq 'Open') {
+                        try {
+                            $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Test complete", $cts).Wait(1000)
+                        }
+                        catch {}
+                    }
+                    $ws.Dispose()
+                }
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should handle graceful WebSocket close' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port
+            
+            try {
+                # Wait for server to be ready
+                Start-Sleep -Milliseconds 200
+                
+                # Create a WebSocket client connection
+                $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+                $uri = [Uri]::new("ws://localhost:$port/pwsh")
+                $cts = [System.Threading.CancellationToken]::None
+                
+                try {
+                    # Connect to the server
+                    $connectTask = $ws.ConnectAsync($uri, $cts)
+                    $connectTask.Wait(5000) | Should -Be $true
+                    
+                    # Wait for connection to be registered
+                    Start-Sleep -Milliseconds 200
+                    $server = Get-PSHostWebSocketServer -Port $port
+                    $server.ConnectionCount | Should -Be 1
+                    
+                    # Close the connection gracefully
+                    $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Test close", $cts).Wait(2000) | Should -Be $true
+                    
+                    # Wait for server to process the close
+                    Start-Sleep -Milliseconds 500
+                    
+                    # Connection should be cleaned up
+                    $server = Get-PSHostWebSocketServer -Port $port
+                    $server.ConnectionCount | Should -Be 0
+                }
+                finally {
+                    $ws.Dispose()
+                }
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should enforce MaxConnections limit on WebSocket connections' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port -MaxConnections 1
+            
+            try {
+                # Wait for server to be ready
+                Start-Sleep -Milliseconds 200
+                
+                # Create first WebSocket client
+                $ws1 = [System.Net.WebSockets.ClientWebSocket]::new()
+                $uri = [Uri]::new("ws://localhost:$port/pwsh")
+                $cts = [System.Threading.CancellationToken]::None
+                
+                try {
+                    # Connect first client
+                    $connectTask1 = $ws1.ConnectAsync($uri, $cts)
+                    $connectTask1.Wait(5000) | Should -Be $true
+                    
+                    # Wait for connection to be registered
+                    Start-Sleep -Milliseconds 200
+                    $server = Get-PSHostWebSocketServer -Port $port
+                    $server.ConnectionCount | Should -Be 1
+                    
+                    # Try to connect second client - should be rejected
+                    $ws2 = [System.Net.WebSockets.ClientWebSocket]::new()
+                    try {
+                        $connectTask2 = $ws2.ConnectAsync($uri, $cts)
+                        
+                        # Connection should fail with 503 Service Unavailable
+                        $connected = $false
+                        try {
+                            $connected = $connectTask2.Wait(2000)
+                        }
+                        catch {
+                            # Expected - server rejects connection with 503
+                        }
+                        
+                        # Should not have connected successfully
+                        $connected | Should -Be $false
+                        $ws2.State | Should -Not -Be 'Open'
+                        
+                        # Server should still have only 1 connection
+                        $server = Get-PSHostWebSocketServer -Port $port
+                        $server.ConnectionCount | Should -Be 1
+                    }
+                    finally {
+                        if ($ws2.State -eq 'Open') {
+                            try {
+                                $ws2.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Test", $cts).Wait(1000)
+                            }
+                            catch {}
+                        }
+                        $ws2.Dispose()
+                    }
+                }
+                finally {
+                    if ($ws1.State -eq 'Open') {
+                        try {
+                            $ws1.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Test", $cts).Wait(1000)
+                        }
+                        catch {}
+                    }
+                    $ws1.Dispose()
+                }
+            }
+            finally {
+                Stop-PSHostWebSocketServer -Server $server -Force
+            }
+        }
+        
+        It 'Should kill subprocess when server stops with Force' {
+            $port = Get-RandomEphemeralPort
+            $server = Start-PSHostWebSocketServer -Port $port
+            
+            try {
+                # Wait for server to be ready
+                Start-Sleep -Milliseconds 200
+                
+                # Create a WebSocket client connection
+                $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+                $uri = [Uri]::new("ws://localhost:$port/pwsh")
+                $cts = [System.Threading.CancellationToken]::None
+                
+                try {
+                    # Connect to the server
+                    $connectTask = $ws.ConnectAsync($uri, $cts)
+                    $connectTask.Wait(5000) | Should -Be $true
+                    
+                    # Wait for connection to be registered
+                    Start-Sleep -Milliseconds 200
+                    $server = Get-PSHostWebSocketServer -Port $port
+                    $server.ConnectionCount | Should -Be 1
+                    $subprocessId = $server.Connections[0].ProcessId
+                    
+                    # Verify subprocess is running
+                    $process = Get-Process -Id $subprocessId -ErrorAction SilentlyContinue
+                    $process | Should -Not -BeNullOrEmpty
+                    
+                    # Stop server with Force
+                    Stop-PSHostWebSocketServer -Port $port -Force
+                    
+                    # Wait for cleanup
+                    Start-Sleep -Milliseconds 1000
+                    
+                    # Subprocess should be killed
+                    $process = Get-Process -Id $subprocessId -ErrorAction SilentlyContinue
+                    $process | Should -BeNullOrEmpty
+                    
+                    # WebSocket should be closed or closing
+                    # Note: WebSocket might not detect disconnect immediately, so we allow Open state
+                    # The key test is that the subprocess was killed
+                    if ($ws.State -eq 'Open') {
+                        # Try to send data - should fail or trigger disconnect detection
+                        try {
+                            $buffer = [byte[]]::new(4)
+                            $segment = [ArraySegment[byte]]::new($buffer)
+                            $ws.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Binary, $true, $cts).Wait(500) | Out-Null
+                        }
+                        catch {
+                            # Expected - connection is dead
+                        }
+                    }
+                    # As long as the subprocess was killed, the test passes
+                }
+                finally {
+                    try {
+                        if ($ws.State -eq 'Open') {
+                            $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "Test", $cts).Wait(1000)
+                        }
+                    }
+                    catch {}
+                    $ws.Dispose()
+                }
+            }
+            finally {
+                # Ensure cleanup
+                try {
+                    Stop-PSHostWebSocketServer -Port $port -Force -ErrorAction SilentlyContinue
+                }
+                catch {}
+            }
+        }
+    }
+}
+

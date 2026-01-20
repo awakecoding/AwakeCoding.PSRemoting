@@ -94,6 +94,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
         public int ConnectionCount => _serverInstance?.ActiveConnections.Count ?? 0;
 
         /// <summary>
+        /// Array of active connections (for PowerShell access)
+        /// </summary>
+        public ConnectionDetails[] Connections => GetConnections().ToArray();
+
+        /// <summary>
         /// Current server state
         /// </summary>
         public ServerState State 
