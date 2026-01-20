@@ -150,6 +150,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 _serverInstance.ListenerThread?.Join(1000);
 
                 State = ServerState.Stopped;
+                Unregister();
             }
             catch (Exception ex)
             {

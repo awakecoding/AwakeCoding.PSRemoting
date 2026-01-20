@@ -244,6 +244,15 @@ namespace AwakeCoding.PSRemoting.PowerShell
             return _servers.Values.FirstOrDefault(s => s.Port == port);
         }
 
+        /// <summary>
+        /// Get a server by pipe name from the global registry
+        /// </summary>
+        public static PSHostServerBase? GetServerByPipeName(string pipeName)
+        {
+            return _servers.Values.OfType<PSHostNamedPipeServer>()
+                .FirstOrDefault(s => s.PipeName.Equals(pipeName, StringComparison.OrdinalIgnoreCase));
+        }
+
         public void Dispose()
         {
             Dispose(true);
