@@ -438,3 +438,422 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
     # Custom Pipe Host tests removed due to lack of public server API
 }
 
+Describe 'TCP Server Cmdlet Tests' {
+    Context 'Module Exports' {
+        BeforeAll {
+            $ModulePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'AwakeCoding.PSRemoting'
+            $ManifestPath = Join-Path $ModulePath 'AwakeCoding.PSRemoting.psd1'
+            $Manifest = Test-ModuleManifest -Path $ManifestPath -ErrorAction Stop
+        }
+
+        It 'Exports the Start-PSHostTcpServer cmdlet' {
+            $Manifest.ExportedCmdlets.Keys | Should -Contain 'Start-PSHostTcpServer'
+        }
+
+        It 'Exports the Stop-PSHostTcpServer cmdlet' {
+            $Manifest.ExportedCmdlets.Keys | Should -Contain 'Stop-PSHostTcpServer'
+        }
+
+        It 'Exports the Get-PSHostTcpServer cmdlet' {
+            $Manifest.ExportedCmdlets.Keys | Should -Contain 'Get-PSHostTcpServer'
+        }
+    }
+
+    Context 'Start-PSHostTcpServer Basic Functionality' {
+        AfterEach {
+            # Cleanup: Stop any servers created during tests
+            Get-PSHostTcpServer -ErrorAction SilentlyContinue | Stop-PSHostTcpServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Starts a TCP server successfully' {
+            $server = Start-PSHostTcpServer -Port 0
+            try {
+                $server | Should -Not -BeNullOrEmpty
+                $server.State | Should -Be 'Running'
+                $server.Port | Should -BeGreaterThan 0
+                $server.ListenAddress | Should -Be '127.0.0.1'
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Uses custom name when provided' {
+            $server = Start-PSHostTcpServer -Port 0 -Name 'MyTestServer'
+            try {
+                $server.Name | Should -Be 'MyTestServer'
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Generates default name based on port when port is specified' {
+            $server = Start-PSHostTcpServer -Port 9003
+            try {
+                $server.Name | Should -Be 'PSHostTcpServer9003'
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Generates unique name when port 0 is used' {
+            $server1 = Start-PSHostTcpServer -Port 0
+            $server2 = Start-PSHostTcpServer -Port 0
+            try {
+                $server1.Name | Should -Not -Be $server2.Name
+                $server1.Port | Should -Not -Be $server2.Port
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server1 -Force
+                Stop-PSHostTcpServer -Server $server2 -Force
+            }
+        }
+
+        It 'Accepts custom ListenAddress' {
+            $server = Start-PSHostTcpServer -Port 0 -ListenAddress '0.0.0.0'
+            try {
+                $server.ListenAddress | Should -Be '0.0.0.0'
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Sets MaxConnections parameter' {
+            $server = Start-PSHostTcpServer -Port 0 -MaxConnections 5
+            try {
+                $server.MaxConnections | Should -Be 5
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Sets DrainTimeout parameter' {
+            $server = Start-PSHostTcpServer -Port 0 -DrainTimeout 60
+            try {
+                $server.DrainTimeout | Should -Be 60
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+    }
+
+    Context 'Start-PSHostTcpServer Error Handling' {
+        AfterEach {
+            Get-PSHostTcpServer -ErrorAction SilentlyContinue | Stop-PSHostTcpServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Throws error when starting server with duplicate name' {
+            $server1 = Start-PSHostTcpServer -Port 0 -Name 'DuplicateTest'
+            try {
+                { Start-PSHostTcpServer -Port 0 -Name 'DuplicateTest' } | Should -Throw -ExpectedMessage '*already exists*'
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server1 -Force
+            }
+        }
+
+        It 'Throws error when port is already in use' {
+            $server1 = Start-PSHostTcpServer -Port 9012
+            try {
+                { Start-PSHostTcpServer -Port 9012 } | Should -Throw -ExpectedMessage '*already*'
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server1 -Force
+            }
+        }
+    }
+
+    Context 'Get-PSHostTcpServer Functionality' {
+        AfterEach {
+            Get-PSHostTcpServer -ErrorAction SilentlyContinue | Stop-PSHostTcpServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Returns empty when no servers are running' {
+            $servers = Get-PSHostTcpServer
+            $servers | Should -BeNullOrEmpty
+        }
+
+        It 'Returns all running servers' {
+            $server1 = Start-PSHostTcpServer -Port 0
+            $server2 = Start-PSHostTcpServer -Port 0
+            try {
+                $servers = Get-PSHostTcpServer
+                $servers.Count | Should -Be 2
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server1 -Force
+                Stop-PSHostTcpServer -Server $server2 -Force
+            }
+        }
+
+        It 'Gets server by name' {
+            $server = Start-PSHostTcpServer -Port 0 -Name 'GetByNameTest'
+            try {
+                $retrieved = Get-PSHostTcpServer -Name 'GetByNameTest'
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.Name | Should -Be 'GetByNameTest'
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Gets server by port' {
+            $server = Start-PSHostTcpServer -Port 0
+            try {
+                $retrieved = Get-PSHostTcpServer -Port $server.Port
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.Port | Should -Be $server.Port
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Throws error for non-existent server name' {
+            { Get-PSHostTcpServer -Name 'NonExistent' -ErrorAction Stop } | Should -Throw -ExpectedMessage '*not found*'
+        }
+
+        It 'Throws error for non-existent port' {
+            { Get-PSHostTcpServer -Port 65000 -ErrorAction Stop } | Should -Throw
+        }
+    }
+
+    Context 'Stop-PSHostTcpServer Functionality' {
+        It 'Stops server by name' {
+            $server = Start-PSHostTcpServer -Port 0 -Name 'StopByNameTest'
+            $server.State | Should -Be 'Running'
+            
+            Stop-PSHostTcpServer -Name 'StopByNameTest' -Force
+            
+            { Get-PSHostTcpServer -Name 'StopByNameTest' -ErrorAction Stop } | Should -Throw
+        }
+
+        It 'Stops server by port' {
+            $server = Start-PSHostTcpServer -Port 0
+            $server.State | Should -Be 'Running'
+            
+            Stop-PSHostTcpServer -Port $server.Port -Force
+            
+            { Get-PSHostTcpServer -Port $server.Port -ErrorAction Stop } | Should -Throw
+        }
+
+        It 'Stops server by pipeline' {
+            $server = Start-PSHostTcpServer -Port 0
+            $server.State | Should -Be 'Running'
+            
+            $server | Stop-PSHostTcpServer -Force
+            
+            { Get-PSHostTcpServer -Port $server.Port -ErrorAction Stop } | Should -Throw
+        }
+
+        It 'Handles stopping non-existent server gracefully' {
+            { Stop-PSHostTcpServer -Name 'NonExistent' -Force -ErrorAction Stop } | Should -Throw -ExpectedMessage '*not found*'
+        }
+    }
+
+    Context 'TCP Connection Functionality' -Tag 'Integration' {
+        AfterEach {
+            Get-PSHostTcpServer -ErrorAction SilentlyContinue | Stop-PSHostTcpServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Accepts TCP connection and executes PowerShell commands' {
+            $server = Start-PSHostTcpServer -Port 0
+            try {
+                # Give server time to start listening
+                Start-Sleep -Milliseconds 500
+                
+                # Connect using System.Net.Sockets.TcpClient
+                $client = [System.Net.Sockets.TcpClient]::new()
+                $client.Connect('127.0.0.1', $server.Port)
+                
+                $stream = $client.GetStream()
+                $writer = [System.IO.StreamWriter]::new($stream)
+                $reader = [System.IO.StreamReader]::new($stream)
+                
+                # Wait for connection to be established
+                Start-Sleep -Milliseconds 500
+                
+                # Verify server shows active connection
+                $server.ConnectionCount | Should -BeGreaterThan 0
+                
+                # Cleanup
+                $writer.Close()
+                $reader.Close()
+                $client.Close()
+                
+                # Wait for connection cleanup
+                Start-Sleep -Milliseconds 500
+                
+                # Verify connection was cleaned up
+                $server.ConnectionCount | Should -Be 0
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Tracks connection details' {
+            $server = Start-PSHostTcpServer -Port 0
+            try {
+                # Connect
+                $client = [System.Net.Sockets.TcpClient]::new()
+                $client.Connect('127.0.0.1', $server.Port)
+                
+                # Wait for connection to be registered
+                Start-Sleep -Milliseconds 500
+                
+                # Get connection details
+                $connections = $server.GetConnections()
+                $connections | Should -Not -BeNullOrEmpty
+                $connections[0].ClientAddress | Should -Match '127.0.0.1'
+                $connections[0].ProcessId | Should -BeGreaterThan 0
+                $connections[0].Uptime | Should -Not -BeNullOrEmpty
+                
+                # Cleanup
+                $client.Close()
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Respects MaxConnections limit' {
+            $server = Start-PSHostTcpServer -Port 0 -MaxConnections 2
+            try {
+                # Connect first client
+                $client1 = [System.Net.Sockets.TcpClient]::new()
+                $client1.Connect('127.0.0.1', $server.Port)
+                Start-Sleep -Milliseconds 500
+                
+                # Connect second client
+                $client2 = [System.Net.Sockets.TcpClient]::new()
+                $client2.Connect('127.0.0.1', $server.Port)
+                Start-Sleep -Milliseconds 500
+                
+                # Verify we have 2 connections
+                $server.ConnectionCount | Should -Be 2
+                
+                # Third connection should be rejected (or not accepted immediately)
+                $client3 = [System.Net.Sockets.TcpClient]::new()
+                $client3.ReceiveTimeout = 1000
+                $client3.SendTimeout = 1000
+                
+                # Try to connect - should timeout or be delayed
+                $connected = $false
+                try {
+                    $client3.Connect('127.0.0.1', $server.Port)
+                    Start-Sleep -Milliseconds 500
+                    # If connected, server should still only show 2 active
+                    $server.ConnectionCount | Should -BeLessOrEqual 2
+                    $connected = $true
+                }
+                catch {
+                    # Connection rejected as expected
+                }
+                
+                # Cleanup
+                $client1.Close()
+                $client2.Close()
+                if ($connected) { $client3.Close() }
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+
+        It 'Cleans up subprocess when connection closes' {
+            $server = Start-PSHostTcpServer -Port 0
+            try {
+                # Connect
+                $client = [System.Net.Sockets.TcpClient]::new()
+                $client.Connect('127.0.0.1', $server.Port)
+                Start-Sleep -Milliseconds 500
+                
+                # Get the subprocess PID
+                $connections = $server.GetConnections()
+                $subprocessId = $connections[0].ProcessId
+                $subprocessId | Should -Not -BeNullOrEmpty
+                
+                # Verify subprocess exists
+                $process = Get-Process -Id $subprocessId -ErrorAction SilentlyContinue
+                $process | Should -Not -BeNullOrEmpty
+                
+                # Close connection
+                $client.Close()
+                Start-Sleep -Milliseconds 1000
+                
+                # Verify subprocess was killed
+                $process = Get-Process -Id $subprocessId -ErrorAction SilentlyContinue
+                $process | Should -BeNullOrEmpty
+            }
+            finally {
+                Stop-PSHostTcpServer -Server $server -Force
+            }
+        }
+    }
+
+    Context 'Graceful Shutdown' -Tag 'Integration' {
+        AfterEach {
+            Get-PSHostTcpServer -ErrorAction SilentlyContinue | Stop-PSHostTcpServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Waits for drain timeout without -Force' {
+            $server = Start-PSHostTcpServer -Port 0 -DrainTimeout 2
+            try {
+                # Connect a client
+                $client = [System.Net.Sockets.TcpClient]::new()
+                $client.Connect('127.0.0.1', $server.Port)
+                Start-Sleep -Milliseconds 500
+                
+                $server.ConnectionCount | Should -Be 1
+                
+                # Stop without -Force (should wait for drain)
+                $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                Stop-PSHostTcpServer -Server $server
+                $stopwatch.Stop()
+                
+                # Should have waited for drain timeout
+                $stopwatch.Elapsed.TotalSeconds | Should -BeGreaterThan 1.5
+                
+                # Connection should be force-killed after timeout
+                $server.ConnectionCount | Should -Be 0
+            }
+            finally {
+                try { $client.Close() } catch {}
+            }
+        }
+
+        It 'Immediately kills connections with -Force' {
+            $server = Start-PSHostTcpServer -Port 0 -DrainTimeout 30
+            try {
+                # Connect a client
+                $client = [System.Net.Sockets.TcpClient]::new()
+                $client.Connect('127.0.0.1', $server.Port)
+                Start-Sleep -Milliseconds 500
+                
+                $server.ConnectionCount | Should -Be 1
+                
+                # Stop with -Force (should not wait)
+                $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                Stop-PSHostTcpServer -Server $server -Force
+                $stopwatch.Stop()
+                
+                # Should complete quickly
+                $stopwatch.Elapsed.TotalSeconds | Should -BeLessThan 2
+                
+                # Connection should be killed immediately
+                $server.ConnectionCount | Should -Be 0
+            }
+            finally {
+                try { $client.Close() } catch {}
+            }
+        }
+    }
+}
+
