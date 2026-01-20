@@ -1403,3 +1403,338 @@ Describe 'PSHostWebSocketServer' {
     }
 }
 
+Describe 'PSHostNamedPipeServer' {
+    Context 'Module Exports' {
+        It 'Should export Start-PSHostNamedPipeServer cmdlet' {
+            Get-Command -Name Start-PSHostNamedPipeServer -Module AwakeCoding.PSRemoting | Should -Not -BeNullOrEmpty
+        }
+        
+        It 'Should export Stop-PSHostNamedPipeServer cmdlet' {
+            Get-Command -Name Stop-PSHostNamedPipeServer -Module AwakeCoding.PSRemoting | Should -Not -BeNullOrEmpty
+        }
+        
+        It 'Should export Get-PSHostNamedPipeServer cmdlet' {
+            Get-Command -Name Get-PSHostNamedPipeServer -Module AwakeCoding.PSRemoting | Should -Not -BeNullOrEmpty
+        }
+    }
+    
+    Context 'Basic Functionality' {
+        AfterEach {
+            # Cleanup any remaining servers
+            Get-PSHostNamedPipeServer -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    Stop-PSHostNamedPipeServer -Server $_ -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                    Write-Warning "Failed to stop server $($_.Name): $_"
+                }
+            }
+        }
+        
+        It 'Should start a named pipe server with random pipe name' {
+            $server = Start-PSHostNamedPipeServer
+            
+            try {
+                $server | Should -Not -BeNullOrEmpty
+                $server.PipeName | Should -Match '^PSHost_[a-f0-9]{32}$'
+                $server.State | Should -Be 'Running'
+                $server.Name | Should -Not -BeNullOrEmpty
+                $server.ConnectionCount | Should -Be 0
+                $server.PipeFullPath | Should -Not -BeNullOrEmpty
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server -Force
+            }
+        }
+        
+        It 'Should start a named pipe server with custom pipe name' {
+            $pipeName = "TestPipe_$(New-Guid)"
+            $server = Start-PSHostNamedPipeServer -PipeName $pipeName
+            
+            try {
+                $server.PipeName | Should -Be $pipeName
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server -Force
+            }
+        }
+        
+        It 'Should start a named pipe server with custom name' {
+            $server = Start-PSHostNamedPipeServer -Name 'CustomNamedPipeServer'
+            
+            try {
+                $server.Name | Should -Be 'CustomNamedPipeServer'
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server -Force
+            }
+        }
+        
+        It 'Should retrieve servers with Get-PSHostNamedPipeServer' {
+            $server = Start-PSHostNamedPipeServer -Name 'TestPipeServer1'
+            
+            try {
+                $retrieved = Get-PSHostNamedPipeServer -Name 'TestPipeServer1'
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.Name | Should -Be 'TestPipeServer1'
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server -Force
+            }
+        }
+        
+        It 'Should retrieve servers by pipe name' {
+            $pipeName = "LookupTest_$(New-Guid)"
+            $server = Start-PSHostNamedPipeServer -PipeName $pipeName
+            
+            try {
+                $retrieved = Get-PSHostNamedPipeServer -PipeName $pipeName
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.PipeName | Should -Be $pipeName
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server -Force
+            }
+        }
+        
+        It 'Should get all named pipe servers' {
+            $server1 = Start-PSHostNamedPipeServer -Name 'Pipe1'
+            $server2 = Start-PSHostNamedPipeServer -Name 'Pipe2'
+            
+            try {
+                $servers = Get-PSHostNamedPipeServer -All
+                $servers.Count | Should -BeGreaterOrEqual 2
+                $servers | Where-Object { $_.Name -eq 'Pipe1' } | Should -Not -BeNullOrEmpty
+                $servers | Where-Object { $_.Name -eq 'Pipe2' } | Should -Not -BeNullOrEmpty
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server1 -Force
+                Stop-PSHostNamedPipeServer -Server $server2 -Force
+            }
+        }
+        
+        It 'Should stop server by name' {
+            $server = Start-PSHostNamedPipeServer -Name 'StopByName'
+            $server.State | Should -Be 'Running'
+            
+            Stop-PSHostNamedPipeServer -Name 'StopByName'
+            
+            # Server should no longer be retrievable
+            $retrieved = Get-PSHostNamedPipeServer -Name 'StopByName' -ErrorAction SilentlyContinue
+            $retrieved | Should -BeNullOrEmpty
+        }
+        
+        It 'Should stop server by pipe name' {
+            $pipeName = "StopByPipe_$(New-Guid)"
+            $server = Start-PSHostNamedPipeServer -PipeName $pipeName
+            $server.State | Should -Be 'Running'
+            
+            Stop-PSHostNamedPipeServer -PipeName $pipeName
+            
+            # Server should no longer be retrievable
+            $retrieved = Get-PSHostNamedPipeServer -PipeName $pipeName -ErrorAction SilentlyContinue
+            $retrieved | Should -BeNullOrEmpty
+        }
+        
+        It 'Should stop server by server object' {
+            $server = Start-PSHostNamedPipeServer
+            $serverName = $server.Name
+            $server.State | Should -Be 'Running'
+            
+            Stop-PSHostNamedPipeServer -Server $server
+            
+            # Server should no longer be retrievable
+            $retrieved = Get-PSHostNamedPipeServer -Name $serverName -ErrorAction SilentlyContinue
+            $retrieved | Should -BeNullOrEmpty
+        }
+        
+        It 'Should handle multiple servers independently' {
+            $server1 = Start-PSHostNamedPipeServer -Name 'MultiPipe1'
+            $server2 = Start-PSHostNamedPipeServer -Name 'MultiPipe2'
+            
+            try {
+                $server1.State | Should -Be 'Running'
+                $server2.State | Should -Be 'Running'
+                $server1.PipeName | Should -Not -Be $server2.PipeName
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server1 -Force
+                Stop-PSHostNamedPipeServer -Server $server2 -Force
+            }
+        }
+        
+        It 'Should enforce MaxConnections limit' {
+            $server = Start-PSHostNamedPipeServer -MaxConnections 2
+            
+            try {
+                $server.MaxConnections | Should -Be 2
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server -Force
+            }
+        }
+        
+        It 'Should reject duplicate server names' {
+            $server1 = Start-PSHostNamedPipeServer -Name 'DuplicatePipeName'
+            
+            try {
+                { Start-PSHostNamedPipeServer -Name 'DuplicatePipeName' } | Should -Throw
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server1 -Force
+            }
+        }
+        
+        It 'Should reject duplicate pipe names' {
+            $pipeName = "DupePipe_$(New-Guid)"
+            $server1 = Start-PSHostNamedPipeServer -PipeName $pipeName
+            
+            try {
+                { Start-PSHostNamedPipeServer -PipeName $pipeName } | Should -Throw
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server1 -Force
+            }
+        }
+    }
+    
+    Context 'Integration Tests' {
+        AfterEach {
+            # Cleanup any remaining servers
+            Get-PSHostNamedPipeServer -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    Stop-PSHostNamedPipeServer -Server $_ -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                    Write-Warning "Failed to stop server $($_.Name): $_"
+                }
+            }
+        }
+        
+        It 'Should accept named pipe client connections' {
+            $pipeName = "IntegrationTest_$(New-Guid)"
+            $server = Start-PSHostNamedPipeServer -PipeName $pipeName
+            
+            try {
+                # Wait for server to be ready
+                Start-Sleep -Milliseconds 200
+                
+                # Create a named pipe client connection
+                $pipeClient = [System.IO.Pipes.NamedPipeClientStream]::new(
+                    ".",
+                    $pipeName,
+                    [System.IO.Pipes.PipeDirection]::InOut,
+                    [System.IO.Pipes.PipeOptions]::Asynchronous)
+                
+                try {
+                    # Connect to the server
+                    $pipeClient.Connect(5000)
+                    
+                    # Verify connection state
+                    $pipeClient.IsConnected | Should -Be $true
+                    
+                    # Wait for server to register the connection
+                    Start-Sleep -Milliseconds 500
+                    
+                    # Server should show 1 connection
+                    $server = Get-PSHostNamedPipeServer -PipeName $pipeName
+                    $server.ConnectionCount | Should -Be 1
+                }
+                finally {
+                    $pipeClient.Dispose()
+                }
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server -Force
+            }
+        }
+        
+        It 'Should track connection details' {
+            $pipeName = "ConnectionDetails_$(New-Guid)"
+            $server = Start-PSHostNamedPipeServer -PipeName $pipeName
+            
+            try {
+                # Wait for server to be ready
+                Start-Sleep -Milliseconds 200
+                
+                # Create a named pipe client connection
+                $pipeClient = [System.IO.Pipes.NamedPipeClientStream]::new(
+                    ".",
+                    $pipeName,
+                    [System.IO.Pipes.PipeDirection]::InOut,
+                    [System.IO.Pipes.PipeOptions]::Asynchronous)
+                
+                try {
+                    $pipeClient.Connect(5000)
+                    
+                    # Wait for server to register the connection
+                    Start-Sleep -Milliseconds 500
+                    
+                    $server = Get-PSHostNamedPipeServer -PipeName $pipeName
+                    $server.Connections | Should -Not -BeNullOrEmpty
+                    $server.Connections[0].ProcessId | Should -Not -BeNullOrEmpty
+                    $server.Connections[0].ConnectedAt | Should -Not -BeNullOrEmpty
+                }
+                finally {
+                    $pipeClient.Dispose()
+                }
+            }
+            finally {
+                Stop-PSHostNamedPipeServer -Server $server -Force
+            }
+        }
+        
+        It 'Should kill subprocess when server stops with Force' {
+            $pipeName = "ForceStop_$(New-Guid)"
+            $server = Start-PSHostNamedPipeServer -PipeName $pipeName
+            
+            try {
+                # Wait for server to be ready
+                Start-Sleep -Milliseconds 200
+                
+                # Create a named pipe client connection
+                $pipeClient = [System.IO.Pipes.NamedPipeClientStream]::new(
+                    ".",
+                    $pipeName,
+                    [System.IO.Pipes.PipeDirection]::InOut,
+                    [System.IO.Pipes.PipeOptions]::Asynchronous)
+                
+                try {
+                    $pipeClient.Connect(5000)
+                    
+                    # Wait for server to register the connection
+                    Start-Sleep -Milliseconds 500
+                    
+                    $server = Get-PSHostNamedPipeServer -PipeName $pipeName
+                    $server.ConnectionCount | Should -Be 1
+                    $subprocessId = $server.Connections[0].ProcessId
+                    
+                    # Verify subprocess is running
+                    $process = Get-Process -Id $subprocessId -ErrorAction SilentlyContinue
+                    $process | Should -Not -BeNullOrEmpty
+                    
+                    # Stop server with Force
+                    Stop-PSHostNamedPipeServer -PipeName $pipeName -Force
+                    
+                    # Wait for cleanup
+                    Start-Sleep -Milliseconds 500
+                    
+                    # Subprocess should be killed
+                    $process = Get-Process -Id $subprocessId -ErrorAction SilentlyContinue
+                    $process | Should -BeNullOrEmpty
+                }
+                finally {
+                    try { $pipeClient.Dispose() } catch {}
+                }
+            }
+            finally {
+                # Ensure cleanup
+                try {
+                    Stop-PSHostNamedPipeServer -PipeName $pipeName -Force -ErrorAction SilentlyContinue
+                }
+                catch {}
+            }
+        }
+    }
+}
+
