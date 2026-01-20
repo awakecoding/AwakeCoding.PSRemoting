@@ -438,3 +438,315 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
     # Custom Pipe Host tests removed due to lack of public server API
 }
 
+
+Describe 'Unified Server Cmdlet Tests' {
+    Context 'Module Exports' {
+        BeforeAll {
+            $ModulePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'AwakeCoding.PSRemoting'
+            $ManifestPath = Join-Path $ModulePath 'AwakeCoding.PSRemoting.psd1'
+            $Manifest = Test-ModuleManifest -Path $ManifestPath -ErrorAction Stop
+        }
+
+        It 'Exports the Start-PSHostServer cmdlet' {
+            $Manifest.ExportedCmdlets.Keys | Should -Contain 'Start-PSHostServer'
+        }
+
+        It 'Exports the Stop-PSHostServer cmdlet' {
+            $Manifest.ExportedCmdlets.Keys | Should -Contain 'Stop-PSHostServer'
+        }
+
+        It 'Exports the Get-PSHostServer cmdlet' {
+            $Manifest.ExportedCmdlets.Keys | Should -Contain 'Get-PSHostServer'
+        }
+    }
+
+    Context 'TCP Server Tests' {
+        AfterEach {
+            Get-PSHostServer -ErrorAction SilentlyContinue | Stop-PSHostServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Starts a TCP server successfully' {
+            $server = Start-PSHostServer -TransportType TCP -Port 0
+            try {
+                $server | Should -Not -BeNullOrEmpty
+                $server.State | Should -Be 'Running'
+                $server.Port | Should -BeGreaterThan 0
+                $server.ListenAddress | Should -Be '127.0.0.1'
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Uses custom name when provided' {
+            $server = Start-PSHostServer -TransportType TCP -Port 0 -Name 'MyTestServer'
+            try {
+                $server.Name | Should -Be 'MyTestServer'
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Accepts custom ListenAddress' {
+            $server = Start-PSHostServer -TransportType TCP -Port 0 -ListenAddress '0.0.0.0'
+            try {
+                $server.ListenAddress | Should -Be '0.0.0.0'
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Sets MaxConnections parameter' {
+            $server = Start-PSHostServer -TransportType TCP -Port 0 -MaxConnections 5
+            try {
+                $server.MaxConnections | Should -Be 5
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Throws error when starting server with duplicate name' {
+            $server1 = Start-PSHostServer -TransportType TCP -Port 0 -Name 'DuplicateTest'
+            try {
+                { Start-PSHostServer -TransportType TCP -Port 0 -Name 'DuplicateTest' -ErrorAction Stop } | Should -Throw -ExpectedMessage '*already exists*'
+            }
+            finally {
+                Stop-PSHostServer -Server $server1 -Force
+            }
+        }
+
+        It 'Throws error when starting server on duplicate port' {
+            $server1 = Start-PSHostServer -TransportType TCP -Port 9012 -Name 'Server1'
+            try {
+                { Start-PSHostServer -TransportType TCP -Port 9012 -Name 'Server2' -ErrorAction Stop } | Should -Throw -ExpectedMessage '*already*'
+            }
+            finally {
+                Stop-PSHostServer -Server $server1 -Force
+            }
+        }
+
+        It 'Gets server by name' {
+            $server = Start-PSHostServer -TransportType TCP -Port 0 -Name 'GetByNameTest'
+            try {
+                $retrieved = Get-PSHostServer -Name 'GetByNameTest'
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.Name | Should -Be 'GetByNameTest'
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Gets server by port' {
+            $server = Start-PSHostServer -TransportType TCP -Port 9015
+            try {
+                $retrieved = Get-PSHostServer -Port 9015
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.Port | Should -Be 9015
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Gets all TCP servers with TransportType filter' {
+            $server1 = Start-PSHostServer -TransportType TCP -Port 0
+            $server2 = Start-PSHostServer -TransportType TCP -Port 0
+            try {
+                $servers = Get-PSHostServer -TransportType TCP
+                $servers | Should -HaveCount 2
+            }
+            finally {
+                Stop-PSHostServer -Server $server1 -Force
+                Stop-PSHostServer -Server $server2 -Force
+            }
+        }
+
+        It 'Stops server by name' {
+            $server = Start-PSHostServer -TransportType TCP -Port 0 -Name 'StopByNameTest'
+            Stop-PSHostServer -Name 'StopByNameTest'
+            $retrieved = Get-PSHostServer -Name 'StopByNameTest' -ErrorAction SilentlyContinue
+            $retrieved | Should -BeNullOrEmpty
+        }
+
+        It 'Stops server by port' {
+            $server = Start-PSHostServer -TransportType TCP -Port 9020
+            Stop-PSHostServer -Port 9020
+            $retrieved = Get-PSHostServer -Port 9020 -ErrorAction SilentlyContinue
+            $retrieved | Should -BeNullOrEmpty
+        }
+
+        It 'Stops server by server object' {
+            $server = Start-PSHostServer -TransportType TCP -Port 0
+            $port = $server.Port
+            Stop-PSHostServer -Server $server
+            $retrieved = Get-PSHostServer -Port $port -ErrorAction SilentlyContinue
+            $retrieved | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'WebSocket Server Tests' {
+        AfterEach {
+            Get-PSHostServer -ErrorAction SilentlyContinue | Stop-PSHostServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Starts a WebSocket server successfully' {
+            $server = Start-PSHostServer -TransportType WebSocket -Port 8080
+            try {
+                $server | Should -Not -BeNullOrEmpty
+                $server.State | Should -Be 'Running'
+                $server.Port | Should -Be 8080
+                $server.Path | Should -Be '/pwsh'
+                $server.UseSecureConnection | Should -Be $false
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Uses custom path when provided' {
+            $server = Start-PSHostServer -TransportType WebSocket -Port 8081 -Path '/custom'
+            try {
+                $server.Path | Should -Be '/custom'
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Sets UseSecureConnection flag' {
+            $server = Start-PSHostServer -TransportType WebSocket -Port 8082 -UseSecureConnection
+            try {
+                $server.UseSecureConnection | Should -Be $true
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Throws error when port is 0' {
+            { Start-PSHostServer -TransportType WebSocket -Port 0 -ErrorAction Stop } | Should -Throw -ExpectedMessage '*specific port*'
+        }
+
+        It 'Gets all WebSocket servers with TransportType filter' {
+            $server1 = Start-PSHostServer -TransportType WebSocket -Port 8090
+            $server2 = Start-PSHostServer -TransportType WebSocket -Port 8091
+            try {
+                $servers = Get-PSHostServer -TransportType WebSocket
+                $servers | Should -HaveCount 2
+            }
+            finally {
+                Stop-PSHostServer -Server $server1 -Force
+                Stop-PSHostServer -Server $server2 -Force
+            }
+        }
+    }
+
+    Context 'NamedPipe Server Tests' {
+        AfterEach {
+            Get-PSHostServer -ErrorAction SilentlyContinue | Stop-PSHostServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Starts a named pipe server with random pipe name' {
+            $server = Start-PSHostServer -TransportType NamedPipe
+            try {
+                $server | Should -Not -BeNullOrEmpty
+                $server.State | Should -Be 'Running'
+                $server.PipeName | Should -Not -BeNullOrEmpty
+                $server.Port | Should -Be 0
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Starts a named pipe server with custom pipe name' {
+            $pipeName = "TestPipe$(Get-Random)"
+            $server = Start-PSHostServer -TransportType NamedPipe -PipeName $pipeName
+            try {
+                $server.PipeName | Should -Be $pipeName
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Gets server by pipe name' {
+            $pipeName = "GetByPipeTest$(Get-Random)"
+            $server = Start-PSHostServer -TransportType NamedPipe -PipeName $pipeName
+            try {
+                $retrieved = Get-PSHostServer -PipeName $pipeName
+                $retrieved | Should -Not -BeNullOrEmpty
+                $retrieved.PipeName | Should -Be $pipeName
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Stops server by pipe name' {
+            $pipeName = "StopByPipeTest$(Get-Random)"
+            $server = Start-PSHostServer -TransportType NamedPipe -PipeName $pipeName
+            Stop-PSHostServer -PipeName $pipeName
+            $retrieved = Get-PSHostServer -PipeName $pipeName -ErrorAction SilentlyContinue
+            $retrieved | Should -BeNullOrEmpty
+        }
+
+        It 'Throws error when starting server with duplicate pipe name' {
+            $pipeName = "DuplicatePipeTest$(Get-Random)"
+            $server1 = Start-PSHostServer -TransportType NamedPipe -PipeName $pipeName -Name "UniqueName$(Get-Random)"
+            try {
+                { Start-PSHostServer -TransportType NamedPipe -PipeName $pipeName -Name "UniqueName$(Get-Random)" -ErrorAction Stop } | Should -Throw -ExpectedMessage '*already*'
+            }
+            finally {
+                Stop-PSHostServer -Server $server1 -Force
+            }
+        }
+
+        It 'Gets all NamedPipe servers with TransportType filter' {
+            $server1 = Start-PSHostServer -TransportType NamedPipe
+            $server2 = Start-PSHostServer -TransportType NamedPipe
+            try {
+                $servers = Get-PSHostServer -TransportType NamedPipe
+                $servers | Should -HaveCount 2
+            }
+            finally {
+                Stop-PSHostServer -Server $server1 -Force
+                Stop-PSHostServer -Server $server2 -Force
+            }
+        }
+    }
+
+    Context 'Mixed Transport Tests' {
+        AfterEach {
+            Get-PSHostServer -ErrorAction SilentlyContinue | Stop-PSHostServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Can run all three transport types simultaneously' {
+            $tcpServer = Start-PSHostServer -TransportType TCP -Port 0
+            $wsServer = Start-PSHostServer -TransportType WebSocket -Port 8100
+            $pipeServer = Start-PSHostServer -TransportType NamedPipe
+            try {
+                $allServers = Get-PSHostServer
+                $allServers | Should -HaveCount 3
+                
+                $tcpServers = Get-PSHostServer -TransportType TCP
+                $tcpServers | Should -HaveCount 1
+                
+                $wsServers = Get-PSHostServer -TransportType WebSocket
+                $wsServers | Should -HaveCount 1
+                
+                $pipeServers = Get-PSHostServer -TransportType NamedPipe
+                $pipeServers | Should -HaveCount 1
+            }
+            finally {
+                Stop-PSHostServer -Server $tcpServer -Force
+                Stop-PSHostServer -Server $wsServer -Force
+                Stop-PSHostServer -Server $pipeServer -Force
+            }
+        }
+    }
+}
