@@ -1,12 +1,21 @@
 # AwakeCoding PSRemoting Extensions
 
+PowerShell remoting without network transport - create local PowerShell sessions via subprocess stdio, and host remoting endpoints via TCP, WebSocket, or Named Pipes.
+
 ## Installation
 
 ```powershell
 Install-Module AwakeCoding.PSRemoting
 ```
 
-## New-PSHostSession usage
+## Features
+
+- **Client Sessions**: Create PSSession objects connected to local PowerShell subprocesses
+- **Server Infrastructure**: Host PowerShell remoting endpoints on TCP, WebSocket, or Named Pipe transports
+- **Process Connection**: Connect to existing PowerShell processes via named pipes
+- **Cross-Platform**: Works on Windows, Linux, and macOS
+
+## New-PSHostSession - Local Subprocess Sessions
 
 The `New-PSHostSession` cmdlet creates a [PSSession object](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_pssessions) connected to a PowerShell host subprocess:
 
@@ -115,9 +124,117 @@ This is similar to [Start-Job](https://learn.microsoft.com/en-us/powershell/modu
 
 Process isolation to avoid assembly loading conflicts, especially inside a parent .NET process which uses Microsoft Graph or Azure-related assemblies. Using WinRM on localhost can provide a similar result, but it requires configuring the WinRM listener, and you may hit problems with NTLM. There is obviously an overhead involved in launching a complete new PowerShell process to run something isolated, but sometimes it's the best (and only) solution to the problem.
 
+## Server Infrastructure - Hosting Remoting Endpoints
+
+The module provides unified server cmdlets to host PowerShell remoting endpoints using different transport types.
+
+### Start-PSHostServer - TCP Transport
+
+Start a TCP server on a specific port (or use port 0 for auto-assignment):
+
+```powershell
+# Start TCP server on port 8080
+$server = Start-PSHostServer -TransportType TCP -Port 8080
+
+# Connect from another PowerShell session
+Enter-PSSession -HostName localhost -Port 8080
+```
+
+### Start-PSHostServer - WebSocket Transport
+
+Start a WebSocket server with custom path and optional SSL:
+
+```powershell
+# Start WebSocket server
+$server = Start-PSHostServer -TransportType WebSocket -Port 8081 -Path '/pwsh'
+
+# With SSL (requires certificate configuration)
+$server = Start-PSHostServer -TransportType WebSocket -Port 8082 -UseSecureConnection
+```
+
+### Start-PSHostServer - Named Pipe Transport
+
+Start a named pipe server (generates random pipe name by default):
+
+```powershell
+# Start with auto-generated pipe name
+$server = Start-PSHostServer -TransportType NamedPipe
+
+# Start with custom pipe name
+$server = Start-PSHostServer -TransportType NamedPipe -PipeName 'MyCustomPipe'
+```
+
+### Managing Servers
+
+```powershell
+# List all running servers
+Get-PSHostServer
+
+# Filter by transport type
+Get-PSHostServer -TransportType TCP
+
+# Stop server by name
+Stop-PSHostServer -Name 'PSHostTcpServer8080'
+
+# Stop server by port
+Stop-PSHostServer -Port 8080
+
+# Stop server by pipe name
+Stop-PSHostServer -PipeName 'MyCustomPipe'
+
+# Stop server forcefully (kills active connections immediately)
+Stop-PSHostServer -Name 'MyServer' -Force
+```
+
+### Server Properties
+
+Servers track state and connection information:
+
+```powershell
+$server = Start-PSHostServer -TransportType TCP -Port 8080
+
+$server.State            # Running, Stopped, Starting, Stopping, Failed
+$server.Port             # Listening port
+$server.ConnectionCount  # Number of active connections
+$server.Connections      # Array of connection details
+$server.MaxConnections   # Maximum allowed connections (0 = unlimited)
+$server.DrainTimeout     # Graceful shutdown timeout in seconds
+```
+
+## Connect-PSHostProcess - Attach to Running PowerShell
+
+Connect to an existing PowerShell process via named pipes:
+
+```powershell
+# Connect by process ID
+$session = Connect-PSHostProcess -Id 12345
+
+# Connect by process name
+$session = Connect-PSHostProcess -Name 'pwsh'
+
+# Connect by Process object
+$process = Get-Process -Name 'pwsh' | Select-Object -First 1
+$session = Connect-PSHostProcess -Process $process
+
+# Enter the connected session
+$session | Enter-PSSession
+```
+
 ## Building and running
 
-Run the build.ps1 script to build the C# project, then launch a new PowerShell process with the local copy of the module loaded:
+Run the build.ps1 script to build the C# project:
+
+```powershell
+.\build.ps1
+```
+
+Run tests:
+
+```powershell
+.\test.ps1  # Builds and runs all 51 Pester tests
+```
+
+Launch a new PowerShell process with the local copy of the module loaded:
 
 ```powershell
 .\build.ps1 && pwsh -Command { Import-Module .\AwakeCoding.PSRemoting } -NoExit

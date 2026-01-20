@@ -2,18 +2,35 @@
 
 ## Project Overview
 
-This is a **hybrid .NET/PowerShell module** that creates PSSession objects connected to PowerShell host subprocesses. It enables PowerShell remoting without network transport by spawning local PowerShell processes (pwsh.exe or powershell.exe) and communicating via standard input/output streams.
+This is a **hybrid .NET/PowerShell module** that provides PowerShell remoting capabilities without network transport. It supports:
+1. **Client Sessions**: Creating PSSession objects connected to local PowerShell subprocesses via stdio streams
+2. **Server Infrastructure**: Hosting PowerShell remoting endpoints via TCP, WebSocket, and Named Pipe transports
 
-**Architecture**: C# binary module (compiled to DLL) → loaded by PowerShell → exposes `New-PSHostSession` cmdlet
+**Architecture**: C# binary module (compiled to DLL) → loaded by PowerShell → exposes client and server cmdlets
 
 ## Key Components
 
-- [`src/PSHostSession.cs`](../src/PSHostSession.cs) - Core cmdlet implementation with custom transport manager
-  - `NewPSHostSessionCommand` - The main cmdlet that creates PSSessions
-  - `PSHostClientSessionTransportMgr` - Custom transport using Process stdio instead of network
-  - `PSHostClientInfo` - Connection info storing executable path and arguments
-- [`src/PowerShellFinder.cs`](../src/PowerShellFinder.cs) - Logic to locate PowerShell executables in PATH
-- [`AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1`](../AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1) - Module manifest defining metadata and exports
+### Client-Side Components
+- [`src/PSHostSessionCommands.cs`](../src/PSHostSessionCommands.cs) - Client cmdlets for creating sessions
+  - `NewPSHostSessionCommand` - Creates PSSessions to local subprocesses
+  - `ConnectPSHostProcessCommand` - Connects to existing PowerShell processes via named pipes
+- [`src/PSHostClientTransport.cs`](../src/PSHostClientTransport.cs) - Client transport using Process stdio
+- [`src/PSHostNamedPipeTransport.cs`](../src/PSHostNamedPipeTransport.cs) - Named pipe client transport
+
+### Server-Side Components
+- [`src/PSHostServerCommands.cs`](../src/PSHostServerCommands.cs) - **Unified server cmdlets** (3 cmdlets for all transports)
+  - `Start-PSHostServer -TransportType <TCP|WebSocket|NamedPipe>` - Start remoting server
+  - `Stop-PSHostServer` - Stop server by name/port/pipe/object
+  - `Get-PSHostServer` - Query running servers with optional transport filter
+- [`src/PSHostServerBase.cs`](../src/PSHostServerBase.cs) - Abstract base class for all server implementations
+- [`src/PSHostTcpServer.cs`](../src/PSHostTcpServer.cs) - TCP transport server (TcpListener)
+- [`src/PSHostWebSocketServer.cs`](../src/PSHostWebSocketServer.cs) - WebSocket transport server (HttpListener)
+- [`src/PSHostNamedPipeServer.cs`](../src/PSHostNamedPipeServer.cs) - Named Pipe transport server (NamedPipeServerStream)
+- [`src/PSHostTransportType.cs`](../src/PSHostTransportType.cs) - Enum defining transport types
+
+### Shared Components
+- [`src/PowerShellFinder.cs`](../src/PowerShellFinder.cs) - Utilities to locate PowerShell executables and generate pipe names
+- [`AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1`](../AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1) - Module manifest (exports 5 cmdlets total)
 
 ## Build & Development Workflow
 
@@ -29,7 +46,19 @@ This script:
 **Testing locally**: After building, import the module from the workspace:
 ```powershell
 Import-Module .\AwakeCoding.PSRemoting\AwakeCoding.PSRemoting.psd1
+
+# Client usage - create local subprocess session
 New-PSHostSession | Enter-PSSession
+
+# Server usage - start TCP server
+$server = Start-PSHostServer -TransportType TCP -Port 8080
+# Connect from another PowerShell session
+Enter-PSSession -HostName localhost -Port 8080
+```
+
+**Run tests**:
+```powershell
+.\test.ps1  # Builds and runs all 51 Pester tests
 ```
 
 ## Project Conventions
@@ -51,13 +80,49 @@ New-PSHostSession | Enter-PSSession
 - Otherwise searches PATH for `pwsh.exe`/`pwsh` or `powershell.exe` (Windows only)
 - Can be overridden with `-ExecutablePath` parameter
 
+**Server Infrastructure**: Servers inherit from `PSHostServerBase` and maintain a global registry. Each transport spawns pwsh subprocesses in server mode (`-s`) and proxies bidirectional data. Servers track state (Stopped/Starting/Running/Stopping/Failed), connection count, and active connections. All servers properly unregister from the global registry when stopped.
+
+**Transport Types**:
+- **TCP**: Uses `TcpListener`, supports port 0 for auto-assignment, thread-based connection handling
+- **WebSocket**: Uses `HttpListener`, requires specific port (>0), supports custom path and SSL, async connection handling
+- **NamedPipe**: Uses `NamedPipeServerStream` with `MaxAllowedServerInstances` for concurrent connections, platform-specific paths (Windows: `\\.\pipe\{name}`, Linux: `/tmp/CoreFxPipe_{name}`)
+
 ## Common Patterns
 
-When adding new cmdlet parameters:
-- Add as properties to `NewPSHostSessionCommand` class
+### Adding New Cmdlet Parameters
+
+For client cmdlets:
+- Add as properties to the cmdlet class (e.g., `NewPSHostSessionCommand`)
 - Mark with `[Parameter()]` attribute
 - Use `[ValidateNotNullOrEmpty()]` for mandatory string parameters
 - Access via properties in `BeginProcessing()` method
+
+For server cmdlets:
+- Unified cmdlets use `-TransportType` enum to select transport
+- Transport-specific parameters (Port, PipeName, Path, etc.) are conditionally validated
+- Common parameters (Name, MaxConnections, DrainTimeout) apply to all transports
+
+### Modifying Server Behavior
+
+Adding new server features:
+1. Add property/method to `PSHostServerBase` if shared across all transports
+2. Override in specific transport class if transport-specific
+3. Update unified cmdlet to expose new parameter if user-facing
+4. Remember to update `StopListenerAsync()` to cleanup new resources
+
+Transport connection handling:
+- TCP/NamedPipe: Thread-based proxy with synchronous read/write loops
+- WebSocket: Async/await pattern with `WebSocketReceiveResult`
+- All: Spawn subprocess with `pwsh -NoLogo -NoProfile -s`, proxy stdio to transport
+
+### Server Lifecycle
+
+1. **Start**: `StartListenerAsync()` → creates listener → starts background thread → sets state to Running → registers in global registry
+2. **Accept**: Background thread waits for connections → spawns pwsh subprocess → creates proxy threads (in/out/err)
+3. **Stop**: `StopListenerAsync()` → cancels listener → drains connections (unless Force) → kills subprocesses → **unregisters from registry**
+4. **Cleanup**: `CleanupConnection()` disposes transport resources, kills subprocess, removes from connection tracking
+
+### Client Transport Behavior
 
 When modifying transport behavior:
 - Edit `PSHostClientSessionTransportMgr.CreateAsync()` for connection setup
