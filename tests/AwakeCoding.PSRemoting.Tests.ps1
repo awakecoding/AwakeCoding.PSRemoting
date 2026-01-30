@@ -246,6 +246,34 @@ Describe 'New-PSHostSession Cmdlet Tests' {
             }
         }
     }
+
+    Context 'Custom Session Parameters' {
+        It 'Can set custom RunspaceName' {
+            $customName = 'MyCustomRunspace'
+            $session = New-PSHostSession -RunspaceName $customName
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+                $session.Name | Should -Be $customName
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Can set custom TransportName' {
+            $customTransport = 'MyCustomTransport'
+            $session = New-PSHostSession -TransportName $customTransport
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+                $session.Transport | Should -Be $customTransport
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+    }
 }
 
 Describe 'Connect-PSHostProcess Cmdlet Tests' {
