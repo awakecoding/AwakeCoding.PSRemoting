@@ -282,6 +282,11 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
             try { $script:HostProcess.Dispose() } catch {}
         }
 
+        AfterEach {
+            # Give the named pipe time to reset between connections (especially needed on macOS)
+            Start-Sleep -Milliseconds 500
+        }
+
         It 'Connects to background host by Id and runs code' {
             $session = Connect-PSHostProcess -Id $script:HostPID
             try {
