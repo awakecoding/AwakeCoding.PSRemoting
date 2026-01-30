@@ -198,9 +198,16 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             // Generate default server name if not provided
+            // Extract enough of the unique portion for a unique name
             if (string.IsNullOrWhiteSpace(Name))
             {
-                Name = $"PSHostNamedPipeServer{PipeName.Substring(0, Math.Min(8, PipeName.Length))}";
+                // PipeName is typically "PSHost_<GUID>", so skip the "PSHost_" prefix
+                // and take the first 12 chars of the GUID for uniqueness
+                int prefixLen = "PSHost_".Length;
+                string uniquePart = PipeName.Length > prefixLen 
+                    ? PipeName.Substring(prefixLen, Math.Min(12, PipeName.Length - prefixLen))
+                    : PipeName.Substring(0, Math.Min(12, PipeName.Length));
+                Name = $"PSHostNamedPipeServer{uniquePart}";
             }
 
             // Check if server with this name already exists

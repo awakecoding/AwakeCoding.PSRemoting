@@ -63,10 +63,16 @@ namespace AwakeCoding.PSRemoting.PowerShell
         private static readonly ConcurrentDictionary<string, PSHostServerBase> _servers 
             = new ConcurrentDictionary<string, PSHostServerBase>(StringComparer.OrdinalIgnoreCase);
 
+        // Timeout constants for CI reliability
+        protected const int ListenerThreadJoinTimeoutMs = 3000;
+        protected const int ProcessKillWaitTimeoutMs = 1000;
+        protected const int DefaultWaitForStoppedTimeoutMs = 5000;
+
         protected ServerInstance _serverInstance;
         private object _stateLock = new object();
         private ServerState _state = ServerState.Stopped;
         private Exception? _lastError;
+        private int _stopping = 0; // 0 = not stopping, 1 = stopping (for thread-safe idempotent stop)
 
         /// <summary>
         /// Unique server name
@@ -177,6 +183,41 @@ namespace AwakeCoding.PSRemoting.PowerShell
         public List<ConnectionDetails> GetConnections()
         {
             return _serverInstance?.ActiveConnections.Values.ToList() ?? new List<ConnectionDetails>();
+        }
+
+        /// <summary>
+        /// Wait for the server to fully stop
+        /// </summary>
+        /// <param name="timeoutMs">Timeout in milliseconds (default 5000)</param>
+        /// <returns>True if stopped within timeout, false otherwise</returns>
+        public bool WaitForStopped(int timeoutMs = DefaultWaitForStoppedTimeoutMs)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (State == ServerState.Stopped || State == ServerState.Failed)
+                {
+                    return true;
+                }
+                Thread.Sleep(50);
+            }
+            return State == ServerState.Stopped || State == ServerState.Failed;
+        }
+
+        /// <summary>
+        /// Try to begin stopping - returns true if this call should proceed with stop, false if already stopping
+        /// </summary>
+        protected bool TryBeginStopping()
+        {
+            return Interlocked.CompareExchange(ref _stopping, 1, 0) == 0;
+        }
+
+        /// <summary>
+        /// Reset the stopping flag (called after stop completes)
+        /// </summary>
+        protected void ResetStoppingFlag()
+        {
+            Interlocked.Exchange(ref _stopping, 0);
         }
 
         /// <summary>

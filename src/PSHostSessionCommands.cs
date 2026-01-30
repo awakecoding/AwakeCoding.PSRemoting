@@ -10,10 +10,53 @@ using System.Threading;
 
 namespace AwakeCoding.PSRemoting.PowerShell
 {
+    /// <summary>
+    /// Helper class for runspace readiness checking
+    /// </summary>
+    internal static class RunspaceReadinessHelper
+    {
+        private const int DefaultReadinessTimeoutMs = 5000;
+        private const int ReadinessPollIntervalMs = 50;
+
+        /// <summary>
+        /// Wait for runspace to be fully ready (Opened state + Available)
+        /// </summary>
+        public static bool WaitForRunspaceReady(Runspace runspace, int timeoutMs = DefaultReadinessTimeoutMs)
+        {
+            if (runspace == null)
+                return false;
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+
+            // First wait for Opened state
+            while (runspace.RunspaceStateInfo.State == RunspaceState.Opening && DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(ReadinessPollIntervalMs);
+            }
+
+            if (runspace.RunspaceStateInfo.State != RunspaceState.Opened)
+            {
+                return false;
+            }
+
+            // Then wait for Available (runspace ready to accept commands)
+            while (runspace.RunspaceAvailability != RunspaceAvailability.Available && DateTime.UtcNow < deadline)
+            {
+                Thread.Sleep(ReadinessPollIntervalMs);
+            }
+
+            return runspace.RunspaceStateInfo.State == RunspaceState.Opened &&
+                   runspace.RunspaceAvailability == RunspaceAvailability.Available;
+        }
+    }
+
     [Cmdlet(VerbsCommon.New, "PSHostSession")]
     [OutputType(typeof(PSSession))]
     public sealed class NewPSHostSessionCommand : PSCmdlet
     {
+        private const int DefaultOpenTimeoutMs = 30000;
+        private const int DefaultReadinessTimeoutMs = 5000;
+
         private PSHostClientInfo? _connectionInfo;
         private Runspace? _runspace;
         private ManualResetEvent? _openAsync;
@@ -32,6 +75,14 @@ namespace AwakeCoding.PSRemoting.PowerShell
         [Parameter()]
         [ValidateNotNullOrEmpty()]
         public string TransportName { get; set; } = "PSHostSession";
+
+        /// <summary>
+        /// Timeout in milliseconds for opening the runspace connection.
+        /// Default is 30000 (30 seconds).
+        /// </summary>
+        [Parameter()]
+        [ValidateRange(1000, 300000)]
+        public int OpenTimeout { get; set; } = DefaultOpenTimeoutMs;
 
         protected override void BeginProcessing()
         {
@@ -69,7 +120,29 @@ namespace AwakeCoding.PSRemoting.PowerShell
             try
             {
                 _runspace.OpenAsync();
-                _openAsync.WaitOne();
+
+                // Wait for runspace to reach Opened/Closed/Broken state with timeout
+                if (!_openAsync.WaitOne(OpenTimeout))
+                {
+                    // Timeout - clean up and throw
+                    try { _runspace.Dispose(); } catch { }
+                    throw new TimeoutException($"Runspace open timed out after {OpenTimeout}ms");
+                }
+
+                // Check if runspace opened successfully
+                if (_runspace.RunspaceStateInfo.State != RunspaceState.Opened)
+                {
+                    var reason = _runspace.RunspaceStateInfo.Reason;
+                    throw new InvalidOperationException(
+                        $"Failed to open runspace: {reason?.Message ?? "Unknown error"}",
+                        reason);
+                }
+
+                // Wait for runspace to be fully ready (Available)
+                if (!RunspaceReadinessHelper.WaitForRunspaceReady(_runspace, DefaultReadinessTimeoutMs))
+                {
+                    WriteWarning("Runspace opened but may not be fully ready for commands");
+                }
 
                 WriteObject(
                     PSSession.Create(
@@ -160,6 +233,22 @@ namespace AwakeCoding.PSRemoting.PowerShell
         [ValidateNotNullOrEmpty()]
         public string TransportName { get; set; } = "PSHostProcess";
 
+        /// <summary>
+        /// Timeout in milliseconds for opening the connection.
+        /// Default is 5000 (5 seconds).
+        /// </summary>
+        [Parameter()]
+        [ValidateRange(1000, 300000)]
+        public int OpenTimeout { get; set; } = 5000;
+
+        /// <summary>
+        /// Timeout in milliseconds waiting for runspace to be fully ready.
+        /// Default is 5000 (5 seconds).
+        /// </summary>
+        [Parameter()]
+        [ValidateRange(500, 60000)]
+        public int ReadinessTimeout { get; set; } = 5000;
+
         protected override void BeginProcessing()
         {
             string computerName = "localhost";
@@ -229,6 +318,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             _connectionInfo = new PSHostNamedPipeInfo(computerName, pipeName, AppDomainName);
+            _connectionInfo.OpenTimeout = OpenTimeout;
 
             _runspace = RunspaceFactory.CreateRunspace(
                 connectionInfo: _connectionInfo,
@@ -245,8 +335,27 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 _runspace.OpenAsync();
 
                 // Wait with timeout to prevent hanging on busy/unresponsive connections
-                // If timeout, the session will be returned in Broken state
-                _openAsync.WaitOne(_connectionInfo.OpenTimeout);
+                if (!_openAsync.WaitOne(OpenTimeout))
+                {
+                    // Timeout - clean up and throw
+                    try { _runspace.Dispose(); } catch { }
+                    throw new TimeoutException($"Named pipe connection timed out after {OpenTimeout}ms");
+                }
+
+                // Check if runspace opened successfully
+                if (_runspace.RunspaceStateInfo.State != RunspaceState.Opened)
+                {
+                    var reason = _runspace.RunspaceStateInfo.Reason;
+                    throw new InvalidOperationException(
+                        $"Failed to connect to process: {reason?.Message ?? "Unknown error"}",
+                        reason);
+                }
+
+                // Wait for runspace to be fully ready (Available)
+                if (!RunspaceReadinessHelper.WaitForRunspaceReady(_runspace, ReadinessTimeout))
+                {
+                    WriteWarning("Runspace opened but may not be fully ready for commands");
+                }
 
                 WriteObject(
                     PSSession.Create(

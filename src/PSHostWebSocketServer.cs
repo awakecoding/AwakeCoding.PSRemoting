@@ -45,13 +45,34 @@ namespace AwakeCoding.PSRemoting.PowerShell
             
             // Build the listener prefix
             // HttpListener requires trailing slash
-            // Use '+' for wildcard binding (listens on all interfaces for the specified port)
-            // This allows clients to connect via localhost, 127.0.0.1, or any other network interface
             string scheme = useSecureConnection ? "https" : "http";
-            string bindHost = "+"; // Always use '+' for wildcard binding
+            
+            // Determine the bind host for HttpListener:
+            // - Use "localhost" for loopback addresses (127.0.0.1, localhost, ::1) - works without admin
+            // - Use "+" for wildcard/all interfaces (0.0.0.0, *, +) - requires admin or URL ACL
+            // - Use specific IP for other addresses - requires admin or URL ACL
+            string bindHost;
+            if (listenAddress == "127.0.0.1" || 
+                listenAddress.Equals("localhost", StringComparison.OrdinalIgnoreCase) ||
+                listenAddress == "::1")
+            {
+                // Use "localhost" which has a built-in ACL allowing non-admin access
+                bindHost = "localhost";
+            }
+            else if (listenAddress == "0.0.0.0" || listenAddress == "*" || listenAddress == "+")
+            {
+                // Wildcard binding - requires admin
+                bindHost = "+";
+            }
+            else
+            {
+                // Specific IP address - requires admin or URL ACL
+                bindHost = listenAddress;
+            }
+            
             string httpListenerPrefix = $"{scheme}://{bindHost}:{port}{Path}/";
             
-            // Store the prefix for HttpListener (with + for wildcard)
+            // Store the prefix for HttpListener
             _httpListenerPrefix = httpListenerPrefix;
             
             // Store display prefix (with actual listen address)
@@ -96,8 +117,15 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         public override void StopListenerAsync(bool force)
         {
+            // Idempotent stop - only one thread can proceed
+            if (!TryBeginStopping())
+            {
+                return;
+            }
+
             if (State != ServerState.Running && State != ServerState.Starting)
             {
+                ResetStoppingFlag();
                 return;
             }
 
@@ -136,7 +164,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                             if (!process.HasExited)
                             {
                                 process.Kill();
-                                process.WaitForExit(500);
+                                process.WaitForExit(ProcessKillWaitTimeoutMs);
                             }
                         }
                         catch { }
@@ -146,14 +174,16 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 // Clear all connections
                 _serverInstance.ActiveConnections.Clear();
 
-                // Wait for listener thread to exit
-                _serverInstance.ListenerThread?.Join(1000);
+                // Wait for listener thread to exit with increased timeout for CI reliability
+                _serverInstance.ListenerThread?.Join(ListenerThreadJoinTimeoutMs);
 
-                State = ServerState.Stopped;
+                // Unregister AFTER thread has exited to prevent registry races
                 Unregister();
+                State = ServerState.Stopped;
             }
             catch (Exception ex)
             {
+                Unregister();
                 State = ServerState.Failed;
                 LastError = ex;
                 throw;
@@ -163,6 +193,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 _serverInstance.CancellationTokenSource?.Dispose();
                 _serverInstance.CancellationTokenSource = null;
                 _listener = null;
+                ResetStoppingFlag();
             }
         }
 

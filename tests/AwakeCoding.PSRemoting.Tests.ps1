@@ -6,49 +6,8 @@ BeforeAll {
 
     # Import the module
     Import-Module $ModuleManifest -Force -ErrorAction Stop
-    
-    # Helper function to wait for session to be ready
-    function script:Wait-SessionOpened {
-        param(
-            [Parameter(Mandatory)]
-            [System.Management.Automation.Runspaces.PSSession]$Session,
-            [int]$TimeoutSeconds = 5
-        )
-        $deadline = [datetime]::Now.AddSeconds($TimeoutSeconds)
-        while ($Session.State -eq 'Opening' -and [datetime]::Now -lt $deadline) {
-            Start-Sleep -Milliseconds 50
-        }
-        return $Session.State -eq 'Opened'
-    }
-    
-    # Helper function to create a session with retry logic
-    function script:New-PSHostSessionWithRetry {
-        param(
-            [hashtable]$Parameters = @{},
-            [int]$Attempts = 3,
-            [int]$RetryDelayMs = 200
-        )
-        
-        for ($i = 1; $i -le $Attempts; $i++) {
-            $session = New-PSHostSession @Parameters
-            if ($session -and (Wait-SessionOpened -Session $session -TimeoutSeconds 5)) {
-                # Extra validation: ensure runspace is ready
-                Start-Sleep -Milliseconds 100
-                if ($session.Runspace.RunspaceStateInfo.State -eq 'Opened' -and 
-                    $session.Runspace.RunspaceAvailability -eq 'Available') {
-                    return $session
-                }
-            }
-            if ($session) {
-                Remove-PSHostSessionSafely -Session $session
-            }
-            Start-Sleep -Milliseconds $RetryDelayMs
-        }
-        
-        # Return last attempt even if failed - let the test handle the error
-        return $session
-    }
 
+    # Helper function to safely remove a session
     function script:Remove-PSHostSessionSafely {
         param(
             [System.Management.Automation.Runspaces.PSSession]$Session
@@ -107,7 +66,7 @@ Describe 'Module Manifest Tests' {
 Describe 'New-PSHostSession Cmdlet Tests' {
     Context 'Basic Functionality' {
         It 'Creates a PSSession successfully' {
-            $session = New-PSHostSessionWithRetry
+            $session = New-PSHostSession
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
@@ -120,7 +79,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
         }
 
         It 'Can execute basic arithmetic in remote session' {
-            $session = New-PSHostSessionWithRetry
+            $session = New-PSHostSession
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
@@ -135,7 +94,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
 
     Context 'Process Isolation' {
         It 'Can execute array operations in remote session' {
-            $session = New-PSHostSessionWithRetry
+            $session = New-PSHostSession
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
@@ -149,7 +108,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
         }
 
         It 'Can retrieve PSVersionTable from remote session' {
-            $session = New-PSHostSessionWithRetry
+            $session = New-PSHostSession
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
@@ -166,7 +125,53 @@ Describe 'New-PSHostSession Cmdlet Tests' {
     }
 
     Context 'Session Management' {
-        # Tests removed due to intermittent handle/access errors in the remoting subsystem
+        It 'Can create multiple sessions simultaneously' {
+            $session1 = New-PSHostSession
+            $session2 = New-PSHostSession
+            try {
+                $session1 | Should -Not -BeNullOrEmpty
+                $session2 | Should -Not -BeNullOrEmpty
+                $session1.State | Should -Be 'Opened'
+                $session2.State | Should -Be 'Opened'
+                
+                # Verify both are distinct
+                $session1.InstanceId | Should -Not -Be $session2.InstanceId
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session1
+                Remove-PSHostSessionSafely -Session $session2
+            }
+        }
+
+        It 'Sessions are isolated from each other' {
+            $session1 = New-PSHostSession
+            $session2 = New-PSHostSession
+            try {
+                # Set a variable in session1
+                Invoke-Command -Session $session1 -ScriptBlock { $global:TestVar = 'Session1Value' } -ErrorAction Stop
+                
+                # Verify it's not in session2
+                $result = Invoke-Command -Session $session2 -ScriptBlock { $global:TestVar } -ErrorAction Stop
+                $result | Should -BeNullOrEmpty
+                
+                # Verify it exists in session1
+                $result1 = Invoke-Command -Session $session1 -ScriptBlock { $global:TestVar } -ErrorAction Stop
+                $result1 | Should -Be 'Session1Value'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session1
+                Remove-PSHostSessionSafely -Session $session2
+            }
+        }
+
+        It 'Session state is Closed after removal' {
+            $session = New-PSHostSession
+            $session | Should -Not -BeNullOrEmpty
+            $session.State | Should -Be 'Opened'
+            
+            Remove-PSSession -Session $session -ErrorAction Stop
+            $session.State | Should -Be 'Closed'
+        }
     }
 
     Context 'Windows PowerShell Support' -Skip:(-not $IsWindows) {
@@ -201,7 +206,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
 
     Context 'Module Integration' {
         It 'Can import and use built-in modules' {
-            $session = New-PSHostSessionWithRetry
+            $session = New-PSHostSession
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
@@ -216,7 +221,7 @@ Describe 'New-PSHostSession Cmdlet Tests' {
         }
 
         It 'Can execute Get-Process cmdlet' {
-            $session = New-PSHostSessionWithRetry
+            $session = New-PSHostSession
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
@@ -279,47 +284,6 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
 
     Context 'Remote Execution with Background Host' {
         BeforeAll {
-            function script:Wait-PSHostSessionOpened {
-                param(
-                    [Parameter(Mandatory)]
-                    [System.Management.Automation.Runspaces.PSSession]$Session,
-                    [int]$TimeoutSeconds = 5
-                )
-
-                $deadline = [datetime]::Now.AddSeconds($TimeoutSeconds)
-                while ($Session.State -eq 'Opening' -and [datetime]::Now -lt $deadline) {
-                    Start-Sleep -Milliseconds 50
-                }
-
-                return $Session.State -eq 'Opened'
-            }
-
-            function script:Connect-PSHostProcessWithRetry {
-                param(
-                    [Parameter(Mandatory)]
-                    [ScriptBlock]$Connect,
-                    [int]$Attempts = 3,
-                    [int]$RetryDelayMilliseconds = 200
-                )
-
-                $session = $null
-
-                for ($i = 1; $i -le $Attempts; $i++) {
-                    $session = & $Connect
-                    if ($session -and (Wait-PSHostSessionOpened -Session $session -TimeoutSeconds 5)) {
-                        return $session
-                    }
-
-                    if ($session) {
-                        Remove-PSHostSessionSafely -Session $session
-                    }
-
-                    Start-Sleep -Milliseconds $RetryDelayMilliseconds
-                }
-
-                return $session
-            }
-
             # Launch a detached pwsh host WITHOUT -s so the default named pipe is available
             # Use System.Diagnostics.Process directly for reliable cross-platform behavior
             $script:psi = [System.Diagnostics.ProcessStartInfo]::new()
@@ -364,14 +328,16 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
             try { $script:HostProcess.Dispose() } catch {}
         }
 
+        AfterEach {
+            # Give the named pipe time to reset between connections (especially needed on macOS)
+            Start-Sleep -Milliseconds 500
+        }
+
         It 'Connects to background host by Id and runs code' {
-            $session = Connect-PSHostProcessWithRetry { Connect-PSHostProcess -Id $script:HostPID }
+            $session = Connect-PSHostProcess -Id $script:HostPID
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
-                
-                # Give the runspace a moment to fully initialize
-                Start-Sleep -Milliseconds 100
                 $session.Runspace.RunspaceStateInfo.State | Should -Be 'Opened'
                 $session.Runspace.RunspaceAvailability | Should -Be 'Available'
                 
@@ -385,13 +351,10 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
 
         It 'Connects by Process object' {
             $proc = Get-Process -Id $script:HostPID
-            $session = Connect-PSHostProcessWithRetry { Connect-PSHostProcess -Process $proc }
+            $session = Connect-PSHostProcess -Process $proc
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
-                
-                # Give the runspace a moment to fully initialize
-                Start-Sleep -Milliseconds 100
                 $session.Runspace.RunspaceStateInfo.State | Should -Be 'Opened'
                 $session.Runspace.RunspaceAvailability | Should -Be 'Available'
                 
@@ -408,14 +371,8 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
         It 'Rejects second connection while first session is open' {
             $session1 = Connect-PSHostProcess -Id $script:HostPID
             try {
-                $session2 = Connect-PSHostProcess -Id $script:HostPID
-                try {
-                    # The second session should not be in 'Opened' state
-                    # It may be 'Broken' or 'Opening' (timed out during connection)
-                    $session2.State | Should -Not -Be 'Opened'
-                } finally {
-                    Remove-PSHostSessionSafely -Session $session2
-                }
+                # The second connection should throw since the named pipe is already in use
+                { Connect-PSHostProcess -Id $script:HostPID -OpenTimeout 2000 -ErrorAction Stop } | Should -Throw
             }
             finally {
                 Remove-PSHostSessionSafely -Session $session1
