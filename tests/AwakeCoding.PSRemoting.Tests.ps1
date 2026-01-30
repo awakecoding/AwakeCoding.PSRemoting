@@ -125,7 +125,53 @@ Describe 'New-PSHostSession Cmdlet Tests' {
     }
 
     Context 'Session Management' {
-        # Tests removed due to intermittent handle/access errors in the remoting subsystem
+        It 'Can create multiple sessions simultaneously' {
+            $session1 = New-PSHostSession
+            $session2 = New-PSHostSession
+            try {
+                $session1 | Should -Not -BeNullOrEmpty
+                $session2 | Should -Not -BeNullOrEmpty
+                $session1.State | Should -Be 'Opened'
+                $session2.State | Should -Be 'Opened'
+                
+                # Verify both are distinct
+                $session1.InstanceId | Should -Not -Be $session2.InstanceId
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session1
+                Remove-PSHostSessionSafely -Session $session2
+            }
+        }
+
+        It 'Sessions are isolated from each other' {
+            $session1 = New-PSHostSession
+            $session2 = New-PSHostSession
+            try {
+                # Set a variable in session1
+                Invoke-Command -Session $session1 -ScriptBlock { $global:TestVar = 'Session1Value' } -ErrorAction Stop
+                
+                # Verify it's not in session2
+                $result = Invoke-Command -Session $session2 -ScriptBlock { $global:TestVar } -ErrorAction Stop
+                $result | Should -BeNullOrEmpty
+                
+                # Verify it exists in session1
+                $result1 = Invoke-Command -Session $session1 -ScriptBlock { $global:TestVar } -ErrorAction Stop
+                $result1 | Should -Be 'Session1Value'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session1
+                Remove-PSHostSessionSafely -Session $session2
+            }
+        }
+
+        It 'Session state is Closed after removal' {
+            $session = New-PSHostSession
+            $session | Should -Not -BeNullOrEmpty
+            $session.State | Should -Be 'Opened'
+            
+            Remove-PSSession -Session $session -ErrorAction Stop
+            $session.State | Should -Be 'Closed'
+        }
     }
 
     Context 'Windows PowerShell Support' -Skip:(-not $IsWindows) {
