@@ -65,8 +65,15 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         public override void StopListenerAsync(bool force)
         {
+            // Idempotent stop - only one thread can proceed
+            if (!TryBeginStopping())
+            {
+                return;
+            }
+
             if (State != ServerState.Running && State != ServerState.Starting)
             {
+                ResetStoppingFlag();
                 return;
             }
 
@@ -101,7 +108,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                             if (!process.HasExited)
                             {
                                 process.Kill();
-                                process.WaitForExit(500);
+                                process.WaitForExit(ProcessKillWaitTimeoutMs);
                             }
                         }
                         catch { }
@@ -111,14 +118,16 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 // Clear all connections
                 _serverInstance.ActiveConnections.Clear();
 
-                // Wait for listener thread to exit
-                _serverInstance.ListenerThread?.Join(1000);
+                // Wait for listener thread to exit with increased timeout for CI reliability
+                _serverInstance.ListenerThread?.Join(ListenerThreadJoinTimeoutMs);
 
-                State = ServerState.Stopped;
+                // Unregister AFTER thread has exited to prevent registry races
                 Unregister();
+                State = ServerState.Stopped;
             }
             catch (Exception ex)
             {
+                Unregister();
                 State = ServerState.Failed;
                 LastError = ex;
                 throw;
@@ -127,6 +136,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             {
                 _serverInstance.CancellationTokenSource?.Dispose();
                 _serverInstance.CancellationTokenSource = null;
+                ResetStoppingFlag();
             }
         }
 
