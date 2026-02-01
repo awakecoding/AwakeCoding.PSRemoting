@@ -12,7 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Management.Automation" Version="7.*" />
+    <PackageReference Include="System.Management.Automation" Version="7.4.*" />
     <Reference Include="System.Management.Automation">
       <HintPath>.\Ref\System.Management.Automation.dll</HintPath>
     </Reference>
