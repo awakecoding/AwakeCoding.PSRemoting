@@ -13,6 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest, macos-latest]
+        pwsh-version: ['latest', 'stable']
         
     runs-on: ${{ matrix.os }}
     
@@ -26,9 +27,9 @@ jobs:
         dotnet-version: '9.0.x'
         
     - name: Setup PowerShell Core
-      uses: mchave3/setup-pwsh@v1.0.0
+      uses: ./.github/actions/setup-pwsh
       with:
-        version: 'latest'
+        version: ${{ matrix.pwsh-version }}
         github-token: ${{ secrets.GITHUB_TOKEN }}
         
     - name: Setup PowerShell
@@ -54,10 +55,10 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Building module..."
-        dotnet build -c Release -f net9.0
+        dotnet build -c Release -f net8.0
         
         # Copy DLL to module folder
-        $OutputPath = Join-Path $env:GITHUB_WORKSPACE 'src\bin\Release\net9.0'
+        $OutputPath = Join-Path $env:GITHUB_WORKSPACE 'src\bin\Release\net8.0'
         $ModulePath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting'
         
         Write-Host "Output path: $OutputPath"
@@ -90,5 +91,5 @@ jobs:
       uses: actions/upload-artifact@v4
       if: always()
       with:
-        name: test-results-${{ matrix.os }}
+        name: test-results-${{ matrix.os }}-pwsh-${{ matrix.pwsh-version }}
         path: testResults.xml
