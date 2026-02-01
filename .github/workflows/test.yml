@@ -55,10 +55,10 @@ jobs:
       shell: pwsh
       run: |
         Write-Host "Building module..."
-        dotnet build -c Release -f net9.0
+        dotnet build -c Release -f net8.0
         
         # Copy DLL to module folder
-        $OutputPath = Join-Path $env:GITHUB_WORKSPACE 'src\bin\Release\net9.0'
+        $OutputPath = Join-Path $env:GITHUB_WORKSPACE 'src\bin\Release\net8.0'
         $ModulePath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting'
         
         Write-Host "Output path: $OutputPath"
