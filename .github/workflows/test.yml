@@ -26,7 +26,7 @@ jobs:
         dotnet-version: '9.0.x'
         
     - name: Setup PowerShell Core
-      uses: mchave3/setup-pwsh@v1.0.0
+      uses: ./.github/actions/setup-pwsh
       with:
         version: 'latest'
         github-token: ${{ secrets.GITHUB_TOKEN }}
