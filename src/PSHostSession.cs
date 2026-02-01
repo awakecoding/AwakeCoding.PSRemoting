@@ -71,6 +71,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
     {
         private readonly PSHostClientInfo _connectionInfo;
         private Process? _process = null;
+        private volatile bool _isClosed = false;
 
         internal PSHostClientSessionTransportMgr(
             PSHostClientInfo connectionInfo,
@@ -103,30 +104,82 @@ namespace AwakeCoding.PSRemoting.PowerShell
             SendOneItem();
         }
 
+        public override void CloseAsync()
+        {
+            // Mark as closed to prevent event handler race conditions
+            _isClosed = true;
+
+            // Cancel async read operations first
+            if (_process != null)
+            {
+                try
+                {
+                    _process.CancelOutputRead();
+                }
+                catch { }
+
+                try
+                {
+                    _process.CancelErrorRead();
+                }
+                catch { }
+            }
+
+            // Call base implementation
+            base.CloseAsync();
+        }
+
         private void ErrorDataReceived(object? sender, DataReceivedEventArgs args)
         {
+            // Guard against race conditions during close
+            if (_isClosed) return;
             HandleErrorDataReceived(args.Data);
         }
 
         private void OutputDataReceived(object? sender, DataReceivedEventArgs args)
         {
+            // Guard against race conditions during close
+            if (_isClosed) return;
             HandleOutputDataReceived(args.Data);
         }
 
         protected override void Dispose(bool isDisposing)
         {
-            base.Dispose(isDisposing);
-
             if (isDisposing)
             {
                 CleanupConnection();
             }
+
+            base.Dispose(isDisposing);
         }
 
         protected override void CleanupConnection()
         {
+            _isClosed = true;
+
             if (_process != null)
             {
+                try
+                {
+                    // Unsubscribe event handlers first to prevent race conditions
+                    _process.ErrorDataReceived -= ErrorDataReceived;
+                    _process.OutputDataReceived -= OutputDataReceived;
+                }
+                catch { }
+
+                try
+                {
+                    // Cancel async reads if still active
+                    _process.CancelOutputRead();
+                }
+                catch { }
+
+                try
+                {
+                    _process.CancelErrorRead();
+                }
+                catch { }
+
                 try
                 {
                     if (!_process.HasExited)
