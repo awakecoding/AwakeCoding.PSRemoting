@@ -98,26 +98,12 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         public override void CloseAsync()
         {
-            // Mark as closed to prevent event handler race conditions
-            _isClosed = true;
-
-            // Cancel async read operations first
-            if (_process != null)
-            {
-                try
-                {
-                    _process.CancelOutputRead();
-                }
-                catch { }
-
-                try
-                {
-                    _process.CancelErrorRead();
-                }
-                catch { }
-            }
-
-            // Call base implementation
+            // DO NOT set _isClosed here - the output reader needs to stay active
+            // to receive the CloseAck from the subprocess. Setting _isClosed here
+            // would cause OutputDataReceived to ignore the ack, triggering a 60s timeout.
+            
+            // Call base implementation - it sends close packet and waits for ack
+            // When ack is received, base class calls CleanupConnection()
             base.CloseAsync();
         }
 
@@ -130,7 +116,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         private void OutputDataReceived(object? sender, DataReceivedEventArgs args)
         {
-            // Guard against race conditions during close
+            // Guard against race conditions during close - but we need to allow
+            // the CloseAck packet through, so only check after initial processing
             if (_isClosed) return;
             HandleOutputDataReceived(args.Data);
         }
