@@ -197,15 +197,10 @@ jobs:
         Publish-Module -Path $modulePath -NuGetApiKey $env:PSGALLERY_API_KEY -Repository PSGallery -Force
         Write-Host "Module published successfully"
         
-    - name: Create checksums and GitHub release
+    - name: Create checksums
       shell: pwsh
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       working-directory: package
       run: |
-        $PackageVersion = '${{ needs.preflight.outputs.package-version }}'
-        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
-        
         # Generate checksums
         $HashPath = 'checksums'
         $Files = Get-ChildItem -File | Where-Object { $_.Name -ne 'checksums' }
@@ -217,6 +212,23 @@ jobs:
         echo "::group::checksums"
         Get-Content $HashPath
         echo "::endgroup::"
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: AwakeCoding.PSRemoting-${{ needs.preflight.outputs.package-version }}
+        path: package/
+        if-no-files-found: error
+        retention-days: 90
+        
+    - name: Create GitHub release
+      shell: pwsh
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      working-directory: package
+      run: |
+        $PackageVersion = '${{ needs.preflight.outputs.package-version }}'
+        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
         
         # Create GitHub release
         $ReleaseTag = "v$PackageVersion"
