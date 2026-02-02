@@ -70,8 +70,8 @@ jobs:
           echo "::notice::Skip PSGallery: $SkipPSGallery"
           echo "::notice::Dry Run: $DryRun"
 
-  release:
-    name: Release
+  build:
+    name: Build
     needs: preflight
     runs-on: ubuntu-22.04
     
@@ -99,10 +99,40 @@ jobs:
         # Update csproj
         $csprojPath = Join-Path $env:GITHUB_WORKSPACE 'src/AwakeCoding.PSRemoting.PowerShell.csproj'
         $xml = [xml](Get-Content $csprojPath)
-        $propertyGroup = $xml.Project.PropertyGroup[0]
-        $propertyGroup.Version = $version
-        $propertyGroup.AssemblyVersion = "$version.0"
-        $propertyGroup.FileVersion = "$version.0"
+        
+        # Get first PropertyGroup (handle both single element and array cases)
+        $propertyGroup = $xml.Project.PropertyGroup
+        if ($propertyGroup -is [System.Array]) {
+          $propertyGroup = $propertyGroup[0]
+        }
+        
+        # Update or create Version element
+        if ($null -eq $propertyGroup.Version) {
+          $versionNode = $xml.CreateElement('Version')
+          $versionNode.InnerText = $version
+          $propertyGroup.AppendChild($versionNode) | Out-Null
+        } else {
+          $propertyGroup.Version = $version
+        }
+        
+        # Update or create AssemblyVersion element
+        if ($null -eq $propertyGroup.AssemblyVersion) {
+          $assemblyVersionNode = $xml.CreateElement('AssemblyVersion')
+          $assemblyVersionNode.InnerText = "$version.0"
+          $propertyGroup.AppendChild($assemblyVersionNode) | Out-Null
+        } else {
+          $propertyGroup.AssemblyVersion = "$version.0"
+        }
+        
+        # Update or create FileVersion element
+        if ($null -eq $propertyGroup.FileVersion) {
+          $fileVersionNode = $xml.CreateElement('FileVersion')
+          $fileVersionNode.InnerText = "$version.0"
+          $propertyGroup.AppendChild($fileVersionNode) | Out-Null
+        } else {
+          $propertyGroup.FileVersion = "$version.0"
+        }
+        
         $xml.Save($csprojPath)
         
         Write-Host "Version injected successfully"
@@ -116,7 +146,6 @@ jobs:
         & (Join-Path $env:GITHUB_WORKSPACE "build.ps1")
         
     - name: Create NuGet package
-      id: create_package
       shell: pwsh
       run: |
         # Import helper function
@@ -131,51 +160,15 @@ jobs:
         if (Test-Path $nupkgPath) {
           $nupkgName = Split-Path $nupkgPath -Leaf
           Write-Host "Package created: $nupkgName"
-          echo "nupkg_path=$nupkgPath" >> $env:GITHUB_OUTPUT
-          echo "nupkg_name=$nupkgName" >> $env:GITHUB_OUTPUT
         } else {
           Write-Error "Failed to create NuGet package"
           exit 1
         }
         
-    - name: Publish to PowerShell Gallery
+    - name: Create checksums
       shell: pwsh
-      env:
-        PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
-      run: |
-        $SkipPSGallery = [System.Boolean]::Parse('${{ needs.preflight.outputs.skip-psgallery }}')
-        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
-        
-        if ($SkipPSGallery) {
-          Write-Host "Skipping PowerShell Gallery publishing (skip-psgallery=true)"
-          exit 0
-        }
-        
-        if ($DryRun) {
-          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
-          exit 0
-        }
-        
-        $modulePath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting'
-        
-        if ([string]::IsNullOrEmpty($env:PSGALLERY_API_KEY)) {
-          Write-Error "PSGALLERY_API_KEY secret is not set"
-          exit 1
-        }
-        
-        Write-Host "Publishing module to PowerShell Gallery..."
-        Publish-Module -Path $modulePath -NuGetApiKey $env:PSGALLERY_API_KEY -Repository PSGallery -Force
-        Write-Host "Module published successfully"
-        
-    - name: Create checksums and GitHub release
-      shell: pwsh
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       working-directory: package
       run: |
-        $PackageVersion = '${{ needs.preflight.outputs.package-version }}'
-        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
-        
         # Generate checksums
         $HashPath = 'checksums'
         $Files = Get-ChildItem -File | Where-Object { $_.Name -ne 'checksums' }
@@ -187,8 +180,72 @@ jobs:
         echo "::group::checksums"
         Get-Content $HashPath
         echo "::endgroup::"
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: AwakeCoding.PSRemoting-${{ needs.preflight.outputs.package-version }}
+        path: package/
+        if-no-files-found: error
+        retention-days: 90
+
+  release:
+    name: Release
+    needs: [preflight, build]
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: AwakeCoding.PSRemoting-${{ needs.preflight.outputs.package-version }}
+        path: package/
         
-        # Create GitHub release
+    - name: Publish to PowerShell Gallery
+      shell: pwsh
+      env:
+        PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+      working-directory: package
+      run: |
+        $SkipPSGallery = [System.Boolean]::Parse('${{ needs.preflight.outputs.skip-psgallery }}')
+        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
+        
+        if ($SkipPSGallery) {
+          Write-Host "Skipping PowerShell Gallery publishing (skip-psgallery=true)"
+          exit 0
+        }
+        
+        if ($DryRun) {
+          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
+          Write-Host "Would publish: $(Get-ChildItem -Filter '*.nupkg' | Select-Object -First 1 -ExpandProperty Name)"
+          exit 0
+        }
+        
+        if ([string]::IsNullOrEmpty($env:PSGALLERY_API_KEY)) {
+          Write-Error "PSGALLERY_API_KEY secret is not set"
+          exit 1
+        }
+        
+        # Find the .nupkg file
+        $nupkgPath = Get-ChildItem -Filter "*.nupkg" | Select-Object -First 1 -ExpandProperty FullName
+        
+        if (-not $nupkgPath) {
+          Write-Error "No .nupkg file found in artifacts"
+          exit 1
+        }
+        
+        Write-Host "Publishing package: $(Split-Path $nupkgPath -Leaf)"
+        Publish-PSResource -Path $nupkgPath -ApiKey $env:PSGALLERY_API_KEY -Repository PSGallery
+        Write-Host "Module published successfully"
+        
+    - name: Create GitHub release
+      shell: pwsh
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      working-directory: package
+      run: |
+        $PackageVersion = '${{ needs.preflight.outputs.package-version }}'
+        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
         $ReleaseTag = "v$PackageVersion"
         $ReleaseTitle = "AwakeCoding.PSRemoting v${PackageVersion}"
         $Repository = $env:GITHUB_REPOSITORY
@@ -198,8 +255,10 @@ jobs:
           Write-Host "Would create release: $ReleaseTitle ($ReleaseTag)"
           Write-Host "Files to upload:"
           Get-ChildItem -File | Select-Object Name, Length | Format-Table
-        } else {
-          $ReleaseNotes = @"
+          exit 0
+        }
+        
+        $ReleaseNotes = @"
         ## AwakeCoding.PSRemoting v${PackageVersion}
         
         ### Installation
@@ -210,6 +269,5 @@ jobs:
         ### Changes
         See [PowerShell Gallery](https://www.powershellgallery.com/packages/AwakeCoding.PSRemoting/${PackageVersion}) for details.
         "@
-          
-          & gh release create $ReleaseTag --repo $Repository --title $ReleaseTitle --notes $ReleaseNotes ./*
-        }
+        
+        & gh release create $ReleaseTag --repo $Repository --title $ReleaseTitle --notes $ReleaseNotes ./*
