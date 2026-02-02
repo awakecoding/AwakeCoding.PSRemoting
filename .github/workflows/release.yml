@@ -19,6 +19,9 @@ on:
         type: boolean
         default: true
 
+permissions:
+  contents: write
+
 jobs:
   preflight:
     name: Preflight
