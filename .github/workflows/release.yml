@@ -99,7 +99,12 @@ jobs:
         # Update csproj
         $csprojPath = Join-Path $env:GITHUB_WORKSPACE 'src/AwakeCoding.PSRemoting.PowerShell.csproj'
         $xml = [xml](Get-Content $csprojPath)
-        $propertyGroup = $xml.Project.PropertyGroup[0]
+        
+        # Get first PropertyGroup (handle both single element and array cases)
+        $propertyGroup = $xml.Project.PropertyGroup
+        if ($propertyGroup -is [System.Array]) {
+          $propertyGroup = $propertyGroup[0]
+        }
         
         # Update or create Version element
         if ($null -eq $propertyGroup.Version) {
