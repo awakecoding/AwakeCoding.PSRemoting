@@ -231,7 +231,7 @@ Run the build.ps1 script to build the C# project:
 Run tests:
 
 ```powershell
-.\test.ps1  # Builds and runs all 51 Pester tests
+.\test.ps1
 ```
 
 Launch a new PowerShell process with the local copy of the module loaded:

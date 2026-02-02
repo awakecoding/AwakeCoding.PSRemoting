@@ -1,0 +1,215 @@
+name: Release PowerShell Module
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 2026.1.0) or "latest" for calendar version'
+        default: 'latest'
+        required: true
+        type: string
+      skip-psgallery:
+        description: 'Skip publishing to PowerShell Gallery'
+        required: true
+        type: boolean
+        default: false
+      dry-run:
+        description: 'Dry run (simulate release)'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: ubuntu-22.04
+    outputs:
+      package-version: ${{ steps.info.outputs.package-version }}
+      skip-psgallery: ${{ steps.info.outputs.skip-psgallery }}
+      dry-run: ${{ steps.info.outputs.dry-run }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Package information
+        id: info
+        shell: pwsh
+        run: |
+          $IsMasterBranch = ('${{ github.ref_name }}' -eq 'master' -or '${{ github.ref_name }}' -eq 'main')
+          $IsTaggedRelease = ('${{ github.event_name }}' -eq 'push' -and '${{ github.ref }}' -match '^refs/tags/v')
+          
+          try { $SkipPSGallery = [System.Boolean]::Parse('${{ inputs.skip-psgallery }}') } catch { $SkipPSGallery = $false }
+          try { $DryRun = [System.Boolean]::Parse('${{ inputs.dry-run }}') } catch { $DryRun = $true }
+          
+          # Force dry run when not on master/main branch
+          if (-Not $IsMasterBranch -And -Not $IsTaggedRelease) {
+            $DryRun = $true
+          }
+          
+          # Get version
+          $PackageVersion = '${{ inputs.version }}'
+          if ($IsTaggedRelease) {
+            # Extract version from tag (e.g., v2026.1.0 -> 2026.1.0)
+            $PackageVersion = '${{ github.ref_name }}' -replace '^v', ''
+          } elseif ([string]::IsNullOrEmpty($PackageVersion) -or $PackageVersion -eq 'latest') {
+            # Auto-generate version from date
+            $PackageVersion = (Get-Date -Format "yyyy.M.d")
+          }
+          
+          # Validate version format (major.minor.patch)
+          if ($PackageVersion -NotMatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid version format: $PackageVersion, expected: major.minor.patch (e.g., 2026.1.0)"
+          }
+          
+          echo "package-version=$PackageVersion" >> $env:GITHUB_OUTPUT
+          echo "skip-psgallery=$($SkipPSGallery.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          echo "dry-run=$($DryRun.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          
+          echo "::notice::Version: $PackageVersion"
+          echo "::notice::Skip PSGallery: $SkipPSGallery"
+          echo "::notice::Dry Run: $DryRun"
+
+  release:
+    name: Release
+    needs: preflight
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+        
+    - name: Inject version
+      shell: pwsh
+      run: |
+        $version = "${{ needs.preflight.outputs.package-version }}"
+        Write-Host "Injecting version: $version"
+        
+        # Update module manifest
+        $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1'
+        $content = Get-Content $manifestPath -Raw
+        $content = $content -replace "ModuleVersion = '[^']+'", "ModuleVersion = '$version'"
+        Set-Content -Path $manifestPath -Value $content -NoNewline
+        
+        # Update csproj
+        $csprojPath = Join-Path $env:GITHUB_WORKSPACE 'src/AwakeCoding.PSRemoting.PowerShell.csproj'
+        $xml = [xml](Get-Content $csprojPath)
+        $propertyGroup = $xml.Project.PropertyGroup[0]
+        $propertyGroup.Version = $version
+        $propertyGroup.AssemblyVersion = "$version.0"
+        $propertyGroup.FileVersion = "$version.0"
+        $xml.Save($csprojPath)
+        
+        Write-Host "Version injected successfully"
+        
+    - name: Build module
+      shell: pwsh
+      run: |
+        $version = "${{ needs.preflight.outputs.package-version }}"
+        Write-Host "Building module version $version..."
+        
+        & (Join-Path $env:GITHUB_WORKSPACE "build.ps1")
+        
+    - name: Create NuGet package
+      id: create_package
+      shell: pwsh
+      run: |
+        # Import helper function
+        . "$env:GITHUB_WORKSPACE/scripts/New-ModulePackage.ps1"
+        
+        $modulePath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting'
+        $outputPath = Join-Path $env:GITHUB_WORKSPACE 'package'
+        
+        Write-Host "Creating NuGet package..."
+        $nupkgPath = New-ModulePackage -InputPath $modulePath -OutputPath $outputPath
+        
+        if (Test-Path $nupkgPath) {
+          $nupkgName = Split-Path $nupkgPath -Leaf
+          Write-Host "Package created: $nupkgName"
+          echo "nupkg_path=$nupkgPath" >> $env:GITHUB_OUTPUT
+          echo "nupkg_name=$nupkgName" >> $env:GITHUB_OUTPUT
+        } else {
+          Write-Error "Failed to create NuGet package"
+          exit 1
+        }
+        
+    - name: Publish to PowerShell Gallery
+      shell: pwsh
+      env:
+        PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+      run: |
+        $SkipPSGallery = [System.Boolean]::Parse('${{ needs.preflight.outputs.skip-psgallery }}')
+        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
+        
+        if ($SkipPSGallery) {
+          Write-Host "Skipping PowerShell Gallery publishing (skip-psgallery=true)"
+          exit 0
+        }
+        
+        if ($DryRun) {
+          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
+          exit 0
+        }
+        
+        $modulePath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting'
+        
+        if ([string]::IsNullOrEmpty($env:PSGALLERY_API_KEY)) {
+          Write-Error "PSGALLERY_API_KEY secret is not set"
+          exit 1
+        }
+        
+        Write-Host "Publishing module to PowerShell Gallery..."
+        Publish-Module -Path $modulePath -NuGetApiKey $env:PSGALLERY_API_KEY -Repository PSGallery -Force
+        Write-Host "Module published successfully"
+        
+    - name: Create checksums and GitHub release
+      shell: pwsh
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      working-directory: package
+      run: |
+        $PackageVersion = '${{ needs.preflight.outputs.package-version }}'
+        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
+        
+        # Generate checksums
+        $HashPath = 'checksums'
+        $Files = Get-ChildItem -File | Where-Object { $_.Name -ne 'checksums' }
+        $Files | ForEach-Object {
+          $Hash = Get-FileHash -Algorithm SHA256 $_.FullName
+          "$($Hash.Hash)  $($_.Name)"
+        } | Out-File -FilePath $HashPath -Append -Encoding ASCII
+        
+        echo "::group::checksums"
+        Get-Content $HashPath
+        echo "::endgroup::"
+        
+        # Create GitHub release
+        $ReleaseTag = "v$PackageVersion"
+        $ReleaseTitle = "AwakeCoding.PSRemoting v${PackageVersion}"
+        $Repository = $env:GITHUB_REPOSITORY
+        
+        if ($DryRun) {
+          Write-Host "Dry Run: Skipping GitHub release creation"
+          Write-Host "Would create release: $ReleaseTitle ($ReleaseTag)"
+          Write-Host "Files to upload:"
+          Get-ChildItem -File | Select-Object Name, Length | Format-Table
+        } else {
+          $ReleaseNotes = @"
+        ## AwakeCoding.PSRemoting v${PackageVersion}
+        
+        ### Installation
+        ```powershell
+        Install-Module AwakeCoding.PSRemoting -RequiredVersion ${PackageVersion}
+        ```
+        
+        ### Changes
+        See [PowerShell Gallery](https://www.powershellgallery.com/packages/AwakeCoding.PSRemoting/${PackageVersion}) for details.
+        "@
+          
+          & gh release create $ReleaseTag --repo $Repository --title $ReleaseTitle --notes $ReleaseNotes ./*
+        }
