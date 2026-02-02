@@ -70,8 +70,8 @@ jobs:
           echo "::notice::Skip PSGallery: $SkipPSGallery"
           echo "::notice::Dry Run: $DryRun"
 
-  release:
-    name: Release
+  build:
+    name: Build
     needs: preflight
     runs-on: ubuntu-22.04
     
@@ -146,7 +146,6 @@ jobs:
         & (Join-Path $env:GITHUB_WORKSPACE "build.ps1")
         
     - name: Create NuGet package
-      id: create_package
       shell: pwsh
       run: |
         # Import helper function
@@ -161,41 +160,10 @@ jobs:
         if (Test-Path $nupkgPath) {
           $nupkgName = Split-Path $nupkgPath -Leaf
           Write-Host "Package created: $nupkgName"
-          echo "nupkg_path=$nupkgPath" >> $env:GITHUB_OUTPUT
-          echo "nupkg_name=$nupkgName" >> $env:GITHUB_OUTPUT
         } else {
           Write-Error "Failed to create NuGet package"
           exit 1
         }
-        
-    - name: Publish to PowerShell Gallery
-      shell: pwsh
-      env:
-        PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
-      run: |
-        $SkipPSGallery = [System.Boolean]::Parse('${{ needs.preflight.outputs.skip-psgallery }}')
-        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
-        
-        if ($SkipPSGallery) {
-          Write-Host "Skipping PowerShell Gallery publishing (skip-psgallery=true)"
-          exit 0
-        }
-        
-        if ($DryRun) {
-          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
-          exit 0
-        }
-        
-        $modulePath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting'
-        
-        if ([string]::IsNullOrEmpty($env:PSGALLERY_API_KEY)) {
-          Write-Error "PSGALLERY_API_KEY secret is not set"
-          exit 1
-        }
-        
-        Write-Host "Publishing module to PowerShell Gallery..."
-        Publish-Module -Path $modulePath -NuGetApiKey $env:PSGALLERY_API_KEY -Repository PSGallery -Force
-        Write-Host "Module published successfully"
         
     - name: Create checksums
       shell: pwsh
@@ -220,6 +188,49 @@ jobs:
         path: package/
         if-no-files-found: error
         retention-days: 90
+
+  release:
+    name: Release
+    needs: [preflight, build]
+    runs-on: ubuntu-22.04
+    if: needs.preflight.outputs.dry-run == 'false'
+    
+    steps:
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: AwakeCoding.PSRemoting-${{ needs.preflight.outputs.package-version }}
+        path: package/
+        
+    - name: Publish to PowerShell Gallery
+      shell: pwsh
+      env:
+        PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+      working-directory: package
+      run: |
+        $SkipPSGallery = [System.Boolean]::Parse('${{ needs.preflight.outputs.skip-psgallery }}')
+        
+        if ($SkipPSGallery) {
+          Write-Host "Skipping PowerShell Gallery publishing (skip-psgallery=true)"
+          exit 0
+        }
+        
+        if ([string]::IsNullOrEmpty($env:PSGALLERY_API_KEY)) {
+          Write-Error "PSGALLERY_API_KEY secret is not set"
+          exit 1
+        }
+        
+        # Find the .nupkg file
+        $nupkgPath = Get-ChildItem -Filter "*.nupkg" | Select-Object -First 1 -ExpandProperty FullName
+        
+        if (-not $nupkgPath) {
+          Write-Error "No .nupkg file found in artifacts"
+          exit 1
+        }
+        
+        Write-Host "Publishing package: $(Split-Path $nupkgPath -Leaf)"
+        Publish-PSResource -Path $nupkgPath -ApiKey $env:PSGALLERY_API_KEY -Repository PSGallery
+        Write-Host "Module published successfully"
         
     - name: Create GitHub release
       shell: pwsh
@@ -228,20 +239,11 @@ jobs:
       working-directory: package
       run: |
         $PackageVersion = '${{ needs.preflight.outputs.package-version }}'
-        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
-        
-        # Create GitHub release
         $ReleaseTag = "v$PackageVersion"
         $ReleaseTitle = "AwakeCoding.PSRemoting v${PackageVersion}"
         $Repository = $env:GITHUB_REPOSITORY
         
-        if ($DryRun) {
-          Write-Host "Dry Run: Skipping GitHub release creation"
-          Write-Host "Would create release: $ReleaseTitle ($ReleaseTag)"
-          Write-Host "Files to upload:"
-          Get-ChildItem -File | Select-Object Name, Length | Format-Table
-        } else {
-          $ReleaseNotes = @"
+        $ReleaseNotes = @"
         ## AwakeCoding.PSRemoting v${PackageVersion}
         
         ### Installation
@@ -252,6 +254,5 @@ jobs:
         ### Changes
         See [PowerShell Gallery](https://www.powershellgallery.com/packages/AwakeCoding.PSRemoting/${PackageVersion}) for details.
         "@
-          
-          & gh release create $ReleaseTag --repo $Repository --title $ReleaseTitle --notes $ReleaseNotes ./*
-        }
+        
+        & gh release create $ReleaseTag --repo $Repository --title $ReleaseTitle --notes $ReleaseNotes ./*
