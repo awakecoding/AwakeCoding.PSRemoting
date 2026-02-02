@@ -181,19 +181,11 @@ jobs:
         Get-Content $HashPath
         echo "::endgroup::"
     
-    - name: Upload package artifacts
+    - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
         name: AwakeCoding.PSRemoting-${{ needs.preflight.outputs.package-version }}
         path: package/
-        if-no-files-found: error
-        retention-days: 90
-        
-    - name: Upload module folder
-      uses: actions/upload-artifact@v4
-      with:
-        name: AwakeCoding.PSRemoting-Module-${{ needs.preflight.outputs.package-version }}
-        path: AwakeCoding.PSRemoting/
         if-no-files-found: error
         retention-days: 90
 
@@ -203,22 +195,17 @@ jobs:
     runs-on: ubuntu-22.04
     
     steps:
-    - name: Download package artifacts
+    - name: Download artifacts
       uses: actions/download-artifact@v4
       with:
         name: AwakeCoding.PSRemoting-${{ needs.preflight.outputs.package-version }}
         path: package/
         
-    - name: Download module folder
-      uses: actions/download-artifact@v4
-      with:
-        name: AwakeCoding.PSRemoting-Module-${{ needs.preflight.outputs.package-version }}
-        path: AwakeCoding.PSRemoting/
-        
     - name: Publish to PowerShell Gallery
       shell: pwsh
       env:
         PSGALLERY_API_KEY: ${{ secrets.PSGALLERY_API_KEY }}
+      working-directory: package
       run: |
         $SkipPSGallery = [System.Boolean]::Parse('${{ needs.preflight.outputs.skip-psgallery }}')
         $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
@@ -228,21 +215,30 @@ jobs:
           exit 0
         }
         
-        if ($DryRun) {
-          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
-          Write-Host "Would publish module from: AwakeCoding.PSRemoting/"
-          Get-ChildItem AwakeCoding.PSRemoting/ | Select-Object Name | Format-Table
-          exit 0
-        }
+        # Find the .nupkg file
+        $nupkgFile = Get-ChildItem -Filter "*.nupkg" | Select-Object -First 1
         
-        if ([string]::IsNullOrEmpty($env:PSGALLERY_API_KEY)) {
-          Write-Error "PSGALLERY_API_KEY secret is not set"
+        if (-not $nupkgFile) {
+          Write-Error "No .nupkg file found in artifacts"
           exit 1
         }
         
-        Write-Host "Publishing module from: AwakeCoding.PSRemoting/"
-        Publish-Module -Path AwakeCoding.PSRemoting -NuGetApiKey $env:PSGALLERY_API_KEY -Repository PSGallery -Verbose
-        Write-Host "Module published successfully"
+        $PushArgs = @(
+          'nuget', 'push', $nupkgFile.Name,
+          '--api-key', $env:PSGALLERY_API_KEY,
+          '--source', 'https://www.powershellgallery.com/',
+          '--skip-duplicate', '--no-symbols'
+        )
+        
+        Write-Host "dotnet $($PushArgs -Join ' ')"
+        
+        if ($DryRun) {
+          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
+          Write-Host "Would publish: $($nupkgFile.Name)"
+        } else {
+          & dotnet $PushArgs
+          Write-Host "Module published successfully"
+        }
         
     - name: Create GitHub release
       shell: pwsh
