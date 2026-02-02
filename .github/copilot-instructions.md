@@ -30,7 +30,11 @@ This is a **hybrid .NET/PowerShell module** that provides PowerShell remoting ca
 
 ### Shared Components
 - [`src/PowerShellFinder.cs`](../src/PowerShellFinder.cs) - Utilities to locate PowerShell executables and generate pipe names
+- [`src/PSHostTcpServerTransport.cs`](../src/PSHostTcpServerTransport.cs) - Internal TCP transport connection info and manager (server-side)
 - [`AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1`](../AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1) - Module manifest (exports 5 cmdlets total)
+
+### Deprecated Files
+- [`src/PSHostSession.cs`](../src/PSHostSession.cs) - Deprecated code wrapped in `#if false` (types moved to other files, kept for reference)
 
 ## Build & Development Workflow
 
@@ -40,8 +44,8 @@ Build the module using the provided script:
 ```
 
 This script:
-1. Compiles the C# project: `dotnet build -c Release -f net9.0`
-2. Copies the built DLL from `src/bin/Release/net9.0/` to `AwakeCoding.PSRemoting/` folder
+1. Compiles the C# project: `dotnet build -c Release -f net8.0`
+2. Copies the built DLL from `src/bin/Release/net8.0/` to `AwakeCoding.PSRemoting/` folder
 
 **Testing locally**: After building, import the module from the workspace:
 ```powershell
@@ -58,12 +62,12 @@ Enter-PSSession -HostName localhost -Port 8080
 
 **Run tests**:
 ```powershell
-.\test.ps1  # Builds and runs all 51 Pester tests
+.\test.ps1
 ```
 
 ## Project Conventions
 
-- **Target Framework**: .NET 9.0 (net9.0)
+- **Target Framework**: .NET 8.0 (net8.0)
 - **PowerShell Version**: Requires PowerShell 7.2+ (CompatiblePSEditions = Core only)
 - **Namespace**: All C# code lives in `AwakeCoding.PSRemoting.PowerShell`
 - **Cmdlet Naming**: PowerShell approved verbs only (e.g., `New-PSHostSession`)
