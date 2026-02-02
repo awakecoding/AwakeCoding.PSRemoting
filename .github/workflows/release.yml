@@ -193,7 +193,6 @@ jobs:
     name: Release
     needs: [preflight, build]
     runs-on: ubuntu-22.04
-    if: needs.preflight.outputs.dry-run == 'false'
     
     steps:
     - name: Download artifacts
@@ -209,9 +208,16 @@ jobs:
       working-directory: package
       run: |
         $SkipPSGallery = [System.Boolean]::Parse('${{ needs.preflight.outputs.skip-psgallery }}')
+        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
         
         if ($SkipPSGallery) {
           Write-Host "Skipping PowerShell Gallery publishing (skip-psgallery=true)"
+          exit 0
+        }
+        
+        if ($DryRun) {
+          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
+          Write-Host "Would publish: $(Get-ChildItem -Filter '*.nupkg' | Select-Object -First 1 -ExpandProperty Name)"
           exit 0
         }
         
@@ -239,9 +245,18 @@ jobs:
       working-directory: package
       run: |
         $PackageVersion = '${{ needs.preflight.outputs.package-version }}'
+        $DryRun = [System.Boolean]::Parse('${{ needs.preflight.outputs.dry-run }}')
         $ReleaseTag = "v$PackageVersion"
         $ReleaseTitle = "AwakeCoding.PSRemoting v${PackageVersion}"
         $Repository = $env:GITHUB_REPOSITORY
+        
+        if ($DryRun) {
+          Write-Host "Dry Run: Skipping GitHub release creation"
+          Write-Host "Would create release: $ReleaseTitle ($ReleaseTag)"
+          Write-Host "Files to upload:"
+          Get-ChildItem -File | Select-Object Name, Length | Format-Table
+          exit 0
+        }
         
         $ReleaseNotes = @"
         ## AwakeCoding.PSRemoting v${PackageVersion}
