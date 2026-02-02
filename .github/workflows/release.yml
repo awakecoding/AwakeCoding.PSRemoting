@@ -100,9 +100,34 @@ jobs:
         $csprojPath = Join-Path $env:GITHUB_WORKSPACE 'src/AwakeCoding.PSRemoting.PowerShell.csproj'
         $xml = [xml](Get-Content $csprojPath)
         $propertyGroup = $xml.Project.PropertyGroup[0]
-        $propertyGroup.Version = $version
-        $propertyGroup.AssemblyVersion = "$version.0"
-        $propertyGroup.FileVersion = "$version.0"
+        
+        # Update or create Version element
+        if ($null -eq $propertyGroup.Version) {
+          $versionNode = $xml.CreateElement('Version')
+          $versionNode.InnerText = $version
+          $propertyGroup.AppendChild($versionNode) | Out-Null
+        } else {
+          $propertyGroup.Version = $version
+        }
+        
+        # Update or create AssemblyVersion element
+        if ($null -eq $propertyGroup.AssemblyVersion) {
+          $assemblyVersionNode = $xml.CreateElement('AssemblyVersion')
+          $assemblyVersionNode.InnerText = "$version.0"
+          $propertyGroup.AppendChild($assemblyVersionNode) | Out-Null
+        } else {
+          $propertyGroup.AssemblyVersion = "$version.0"
+        }
+        
+        # Update or create FileVersion element
+        if ($null -eq $propertyGroup.FileVersion) {
+          $fileVersionNode = $xml.CreateElement('FileVersion')
+          $fileVersionNode.InnerText = "$version.0"
+          $propertyGroup.AppendChild($fileVersionNode) | Out-Null
+        } else {
+          $propertyGroup.FileVersion = "$version.0"
+        }
+        
         $xml.Save($csprojPath)
         
         Write-Host "Version injected successfully"
