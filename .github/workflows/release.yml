@@ -215,28 +215,30 @@ jobs:
           exit 0
         }
         
-        if ($DryRun) {
-          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
-          Write-Host "Would publish: $(Get-ChildItem -Filter '*.nupkg' | Select-Object -First 1 -ExpandProperty Name)"
-          exit 0
-        }
-        
-        if ([string]::IsNullOrEmpty($env:PSGALLERY_API_KEY)) {
-          Write-Error "PSGALLERY_API_KEY secret is not set"
-          exit 1
-        }
-        
         # Find the .nupkg file
-        $nupkgPath = Get-ChildItem -Filter "*.nupkg" | Select-Object -First 1 -ExpandProperty FullName
+        $nupkgFile = Get-ChildItem -Filter "*.nupkg" | Select-Object -First 1
         
-        if (-not $nupkgPath) {
+        if (-not $nupkgFile) {
           Write-Error "No .nupkg file found in artifacts"
           exit 1
         }
         
-        Write-Host "Publishing package: $(Split-Path $nupkgPath -Leaf)"
-        Publish-PSResource -Path $nupkgPath -ApiKey $env:PSGALLERY_API_KEY -Repository PSGallery
-        Write-Host "Module published successfully"
+        $PushArgs = @(
+          'nuget', 'push', $nupkgFile.Name,
+          '--api-key', $env:PSGALLERY_API_KEY,
+          '--source', 'https://www.powershellgallery.com/',
+          '--skip-duplicate', '--no-symbols'
+        )
+        
+        Write-Host "dotnet $($PushArgs -Join ' ')"
+        
+        if ($DryRun) {
+          Write-Host "Dry Run: Skipping PowerShell Gallery publishing"
+          Write-Host "Would publish: $($nupkgFile.Name)"
+        } else {
+          & dotnet $PushArgs
+          Write-Host "Module published successfully"
+        }
         
     - name: Create GitHub release
       shell: pwsh
