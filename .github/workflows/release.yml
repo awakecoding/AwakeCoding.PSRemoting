@@ -94,7 +94,7 @@ jobs:
         Write-Host "Injecting version: $version"
         
         # Update module manifest
-        $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1'
+        $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'src/AwakeCoding.PSRemoting.psd1'
         $content = Get-Content $manifestPath -Raw
         $content = $content -replace "ModuleVersion = '[^']+'", "ModuleVersion = '$version'"
         Set-Content -Path $manifestPath -Value $content -NoNewline
