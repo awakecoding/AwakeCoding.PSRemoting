@@ -38,6 +38,21 @@ jobs:
         Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)"
         Write-Host "OS: $($PSVersionTable.OS)"
         Write-Host "Platform: $($PSVersionTable.Platform)"
+    
+    - name: Start SSH test server (Linux only)
+      if: runner.os == 'Linux'
+      run: |
+        echo "Building SSH test Docker image..."
+        docker build -t awakecoding/psssh-test ./tests/docker
+        
+        echo "Starting SSH test container..."
+        docker run -d --name psssh-test -p 2222:22 awakecoding/psssh-test
+        
+        echo "Waiting for SSH to be ready..."
+        timeout 30 bash -c 'until docker exec psssh-test pgrep sshd > /dev/null 2>&1; do sleep 1; done'
+        
+        echo "SSH test server is ready"
+        docker ps | grep psssh-test
         
     - name: Install Pester
       shell: pwsh
@@ -54,24 +69,8 @@ jobs:
     - name: Build module
       shell: pwsh
       run: |
-        Write-Host "Building module..."
-        dotnet build -c Release -f net8.0
-        
-        # Copy DLL to module folder
-        $OutputPath = Join-Path $env:GITHUB_WORKSPACE 'src\bin\Release\net8.0'
-        $ModulePath = Join-Path $env:GITHUB_WORKSPACE 'AwakeCoding.PSRemoting'
-        
-        Write-Host "Output path: $OutputPath"
-        Write-Host "Module path: $ModulePath"
-        
-        $dllPath = Join-Path $OutputPath 'AwakeCoding.PSRemoting.PowerShell.dll'
-        if (Test-Path $dllPath) {
-          Copy-Item $dllPath -Destination (Join-Path $ModulePath 'AwakeCoding.PSRemoting.PowerShell.dll') -Force
-          Write-Host "DLL copied successfully"
-        } else {
-          Write-Error "DLL not found at: $dllPath"
-          exit 1
-        }
+        Write-Host "Building module using build.ps1..."
+        ./build.ps1
         
     - name: Run Pester tests
       shell: pwsh

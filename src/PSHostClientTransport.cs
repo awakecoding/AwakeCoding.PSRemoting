@@ -14,7 +14,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         public string Executable { get; set; }
 
-        public string Arguments { get; set; }
+        public string[] Arguments { get; set; }
 
         public override PSCredential? Credential
         {
@@ -34,7 +34,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             set { throw new NotImplementedException(); }
         }
 
-        public PSHostClientInfo(string computerName, string executable, string arguments)
+        public PSHostClientInfo(string computerName, string executable, string[] arguments)
         {
             ComputerName = computerName;
             Executable = executable;
@@ -79,7 +79,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             _process = new Process();
             _process.StartInfo.FileName = _connectionInfo.Executable;
-            _process.StartInfo.Arguments = _connectionInfo.Arguments;
+            
+            // Use ArgumentList for proper argument handling (preferred over Arguments string)
+            foreach (var arg in _connectionInfo.Arguments)
+            {
+                _process.StartInfo.ArgumentList.Add(arg);
+            }
+            
             _process.StartInfo.RedirectStandardInput = true;
             _process.StartInfo.RedirectStandardOutput = true;
             _process.StartInfo.RedirectStandardError = true;

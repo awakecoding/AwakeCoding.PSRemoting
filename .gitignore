@@ -3,3 +3,4 @@ obj/
 .vs/
 *.dll
 testResults*
+AwakeCoding.PSRemoting/
