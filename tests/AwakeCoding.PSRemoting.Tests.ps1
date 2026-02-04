@@ -1,5 +1,6 @@
 BeforeDiscovery {
     # Detect Docker availability during discovery for skip logic
+    # Test-DockerAvailable checks for Linux container support
     $script:SSHTestingEnabled = $false
     $sshHelperPath = Join-Path $PSScriptRoot 'SSHTestHelper.psm1'
     if (Test-Path $sshHelperPath) {

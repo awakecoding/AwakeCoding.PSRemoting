@@ -114,6 +114,93 @@ WSManStackVersion              3.0
 
 This can be useful to have a script running using the latest PowerShell that can drive executions in multiple older versions of PowerShell through local PSRemoting.
 
+## SSH Transport - Remote PowerShell Over SSH
+
+The `New-PSHostSession` cmdlet supports SSH transport for connecting to remote PowerShell instances over SSH. This provides an alternative to WinRM-based remoting that works across platforms.
+
+### Basic SSH Connection
+
+Connect to a remote PowerShell instance using SSH:
+
+```powershell
+# Basic SSH connection (defaults to port 22)
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server'
+
+# Specify custom port
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server' -Port 2222
+
+# Enter the remote session
+$session | Enter-PSSession
+```
+
+### Key-Based Authentication
+
+Use SSH key files for authentication:
+
+```powershell
+# Connect using SSH private key
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server' `
+    -UserName 'admin' `
+    -KeyFilePath '~/.ssh/id_rsa'
+```
+
+### Password Authentication
+
+Use credentials for password-based authentication:
+
+```powershell
+# Prompt for credentials
+$cred = Get-Credential -UserName 'admin'
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server' -Credential $cred
+
+# Interactive password prompt (if no credential provided)
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server' -UserName 'admin'
+```
+
+### Advanced SSH Options
+
+Customize SSH connection behavior:
+
+```powershell
+# Skip host key verification (useful for testing, not recommended for production)
+$session = New-PSHostSession -SSHTransport -HostName 'test-server' -SkipHostKeyCheck
+
+# Custom SSH subsystem (default is 'powershell')
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server' `
+    -Subsystem 'custom-subsystem'
+
+# Connection timeout (in milliseconds, -1 for infinite)
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server' `
+    -ConnectingTimeout 10000
+
+# Custom SSH options (passed directly to SSH)
+$sshOptions = @{
+    'StrictHostKeyChecking' = 'no'
+    'UserKnownHostsFile' = '/dev/null'
+}
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server' -Options $sshOptions
+
+# Use custom SSH executable path
+$session = New-PSHostSession -SSHTransport -HostName 'remote-server' `
+    -SSHExecutablePath '/usr/local/bin/ssh'
+```
+
+### SSH Requirements
+
+To use SSH transport:
+- **Remote machine** must have PowerShell installed and configured for SSH remoting
+- **SSH server** must be configured with PowerShell as an SSH subsystem
+- **Tmds.Ssh library** handles SSH protocol (included with module)
+
+Configure PowerShell SSH subsystem on remote server:
+```bash
+# Linux/macOS - Add to /etc/ssh/sshd_config
+Subsystem powershell /usr/bin/pwsh -sshs -NoLogo -NoProfile
+
+# Windows - Add to sshd_config
+Subsystem powershell C:\Program Files\PowerShell\7\pwsh.exe -sshs -NoLogo -NoProfile
+```
+
 ## How does New-PSHostSession work?
 
 So, what does `New-PSHostSession` even do? It creates a PowerShell subprocess in *server mode*, meaning it will expect the [PSRemoting protocol](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-psrp/58ff7ff6-8078-45e2-a6ff-d496e188c39a) over standard input/output instead the regular command-line interface. The cmdlet then does the internal plumbing to connect the PSRemoting client to the standard input/output streams of the subprocess, the same way it would be done for [named pipe transports](https://awakecoding.com/posts/powershell-host-ipc-for-any-dotnet-application/).

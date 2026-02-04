@@ -7,7 +7,7 @@ $script:TestImageName = "awakecoding/psssh-test"
 function Test-DockerAvailable {
     <#
     .SYNOPSIS
-    Check if Docker is available and running
+    Check if Docker is available and running with Linux container support
     #>
     try {
         # Check if docker command exists
@@ -20,7 +20,21 @@ function Test-DockerAvailable {
         $output = docker version 2>&1 | Out-String
         
         # Check if we got valid output (contains "Version:")
-        return $output -match 'Version:'
+        if ($output -notmatch 'Version:') {
+            return $false
+        }
+        
+        # Check if Docker is running in Linux containers mode
+        # This is critical because our test Dockerfile uses ubuntu base image
+        $infoOutput = docker info 2>&1 | Out-String
+        
+        # Check for Linux OS/Arch - docker info shows "OSType: linux" or "OS/Arch: linux/..."
+        if ($infoOutput -match 'OSType:\s*linux' -or $infoOutput -match 'OS/Arch:\s*linux') {
+            return $true
+        }
+        
+        # If on Windows without Linux containers, Docker may still respond but can't run our tests
+        return $false
     }
     catch {
         return $false
