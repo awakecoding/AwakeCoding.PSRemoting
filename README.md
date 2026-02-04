@@ -19,6 +19,46 @@ Install-Module AwakeCoding.PSRemoting
 
 The `New-PSHostSession` cmdlet creates a [PSSession object](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_pssessions) connected to a PowerShell host subprocess:
 
+## Enter-PSHostSession - Create and Enter Sessions Directly
+
+The `Enter-PSHostSession` cmdlet combines session creation and interactive entry in a single command. It accepts the same parameters as `New-PSHostSession` but automatically enters the remote session:
+
+```powershell
+# Create subprocess session and enter it interactively
+PS > Enter-PSHostSession
+[localhost] PS > $PID
+24228
+[localhost] PS > exit
+PS > $PID
+19704
+```
+
+This is equivalent to `New-PSHostSession | Enter-PSSession` but more convenient. All transport types are supported:
+
+```powershell
+# Subprocess (default)
+Enter-PSHostSession
+
+# TCP connection
+Enter-PSHostSession -HostName remote-server -Port 8080
+
+# WebSocket connection
+Enter-PSHostSession -Uri ws://localhost:8080/pwsh
+
+# Named pipe connection
+Enter-PSHostSession -PipeName MyPipe
+
+# Connect to existing process
+Enter-PSHostSession -ProcessId 12345
+
+# SSH connection
+Enter-PSHostSession -SSHTransport -HostName remote-server
+```
+
+## Creating Sessions Without Entering
+
+Use `New-PSHostSession` when you want to create a session object for later use with `Invoke-Command` or other remoting cmdlets:
+
 ```powershell
 PS > $PSSession = New-PSHostSession
 PS > $PSSession
@@ -40,7 +80,7 @@ PS > Invoke-Command -Session $PSSession { $PID }
 You can also enter the PowerShell host process to execute commands directly, then exit it to get back into the original process:
 
 ```powershell
-PS > $PSSession | Enter-PSession
+PS > $PSSession | Enter-PSSession
 [localhost] PS > $PID
 24228
 [localhost] PS > exit
