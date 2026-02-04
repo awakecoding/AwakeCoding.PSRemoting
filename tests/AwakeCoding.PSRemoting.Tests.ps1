@@ -1,3 +1,17 @@
+BeforeDiscovery {
+    # Detect Docker availability during discovery for skip logic
+    $script:SSHTestingEnabled = $false
+    $sshHelperPath = Join-Path $PSScriptRoot 'SSHTestHelper.psm1'
+    if (Test-Path $sshHelperPath) {
+        Import-Module $sshHelperPath -Force -ErrorAction SilentlyContinue
+        try {
+            if (Get-Command docker -ErrorAction SilentlyContinue) {
+                $script:SSHTestingEnabled = Test-DockerAvailable
+            }
+        } catch { }
+    }
+}
+
 BeforeAll {
     # Build the module before testing
     $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -6,6 +20,19 @@ BeforeAll {
 
     # Import the module
     Import-Module $ModuleManifest -Force -ErrorAction Stop
+
+    # Check for SSH testing capability (runtime)
+    if (-not $script:SSHTestingEnabled) {
+        $sshHelperPath = Join-Path $PSScriptRoot 'SSHTestHelper.psm1'
+        if (Test-Path $sshHelperPath) {
+            Import-Module $sshHelperPath -Force -ErrorAction SilentlyContinue
+        }
+        try {
+            if (Get-Command docker -ErrorAction SilentlyContinue) {
+                $script:SSHTestingEnabled = Test-DockerAvailable
+            }
+        } catch { }
+    }
 
     # Helper function to safely remove a session
     function script:Remove-PSHostSessionSafely {
@@ -704,6 +731,457 @@ Describe 'Unified Server Cmdlet Tests' {
                 Stop-PSHostServer -Server $wsServer -Force
                 Stop-PSHostServer -Server $pipeServer -Force
             }
+        }
+    }
+}
+
+Describe 'End-to-End Client Transport Tests' {
+    Context 'TCP Client Transport' {
+        BeforeAll {
+            # Start a TCP server for client tests
+            $script:TcpServer = Start-PSHostServer -TransportType TCP -Port 0 -Name 'TcpE2ETest'
+            $script:TcpPort = $script:TcpServer.Port
+        }
+
+        AfterAll {
+            Stop-PSHostServer -Server $script:TcpServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Connects to TCP server and creates session' {
+            $session = New-PSHostSession -HostName 'localhost' -Port $script:TcpPort
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Executes commands over TCP transport' {
+            $session = New-PSHostSession -HostName 'localhost' -Port $script:TcpPort
+            try {
+                $result = Invoke-Command -Session $session -ScriptBlock { 2 + 2 } -ErrorAction Stop
+                $result | Should -Be 4
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Retrieves PSVersionTable over TCP' {
+            $session = New-PSHostSession -HostName 'localhost' -Port $script:TcpPort
+            try {
+                $version = Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -ErrorAction Stop
+                $version | Should -BeGreaterOrEqual 7
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Supports multiple sequential connections' {
+            for ($i = 1; $i -le 3; $i++) {
+                $session = New-PSHostSession -HostName 'localhost' -Port $script:TcpPort
+                try {
+                    $result = Invoke-Command -Session $session -ScriptBlock { param($n) $n * 2 } -ArgumentList $i -ErrorAction Stop
+                    $result | Should -Be ($i * 2)
+                }
+                finally {
+                    Remove-PSHostSessionSafely -Session $session
+                }
+            }
+        }
+    }
+
+    Context 'WebSocket Client Transport' {
+        BeforeAll {
+            # Start a WebSocket server for client tests
+            $script:WsServer = Start-PSHostServer -TransportType WebSocket -Port 8765 -Path '/pwsh' -Name 'WsE2ETest'
+        }
+
+        AfterAll {
+            Stop-PSHostServer -Server $script:WsServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Connects to WebSocket server using URI' {
+            $session = New-PSHostSession -Uri "ws://localhost:$($script:WsServer.Port)/pwsh"
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Executes commands over WebSocket transport' {
+            $session = New-PSHostSession -Uri "ws://localhost:$($script:WsServer.Port)/pwsh"
+            try {
+                $result = Invoke-Command -Session $session -ScriptBlock { 3 + 3 } -ErrorAction Stop
+                $result | Should -Be 6
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Retrieves PSVersionTable over WebSocket' {
+            $session = New-PSHostSession -Uri "ws://localhost:$($script:WsServer.Port)/pwsh"
+            try {
+                $version = Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -ErrorAction Stop
+                $version | Should -BeGreaterOrEqual 7
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Parses host, port, and path from URI correctly' {
+            $session = New-PSHostSession -Uri "ws://localhost:$($script:WsServer.Port)/pwsh"
+            try {
+                $result = Invoke-Command -Session $session -ScriptBlock { 'connected' } -ErrorAction Stop
+                $result | Should -Be 'connected'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+    }
+
+    Context 'NamedPipe Client Transport' {
+        BeforeAll {
+            # Start a named pipe server for client tests
+            $script:PipeName = "PipeE2ETest$(Get-Random)"
+            $script:PipeServer = Start-PSHostServer -TransportType NamedPipe -PipeName $script:PipeName -Name 'PipeE2ETest'
+        }
+
+        AfterAll {
+            Stop-PSHostServer -Server $script:PipeServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Connects to named pipe server' {
+            $session = New-PSHostSession -PipeName $script:PipeName
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Executes commands over named pipe transport' {
+            $session = New-PSHostSession -PipeName $script:PipeName
+            try {
+                $result = Invoke-Command -Session $session -ScriptBlock { 4 + 4 } -ErrorAction Stop
+                $result | Should -Be 8
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Retrieves PSVersionTable over named pipe' {
+            $session = New-PSHostSession -PipeName $script:PipeName
+            try {
+                $version = Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -ErrorAction Stop
+                $version | Should -BeGreaterOrEqual 7
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+    }
+
+    Context 'Transport Error Handling' {
+        It 'Throws timeout error when TCP server not listening' {
+            { New-PSHostSession -HostName 'localhost' -Port 59999 -OpenTimeout 2000 -ErrorAction Stop } | Should -Throw
+        }
+
+        It 'Throws error for invalid WebSocket URI scheme' {
+            { New-PSHostSession -Uri 'http://localhost:8080/pwsh' -ErrorAction Stop } | Should -Throw -ExpectedMessage '*Invalid WebSocket URI*'
+        }
+
+        It 'Throws timeout error when named pipe does not exist' {
+            { New-PSHostSession -PipeName 'NonExistentPipe12345' -OpenTimeout 2000 -ErrorAction Stop } | Should -Throw
+        }
+    }
+}
+
+Describe 'SSH Transport Tests' {
+    BeforeAll {
+        # Import SSH test helper
+        $SSHHelperPath = Join-Path $PSScriptRoot 'SSHTestHelper.psm1'
+        Import-Module $SSHHelperPath -Force
+
+        # Check if Docker is available - must be set before Context blocks for skip logic
+        $script:DockerAvailable = Test-DockerAvailable
+        
+        if ($script:DockerAvailable) {
+            Write-Host "Docker available - starting SSH test container..." -ForegroundColor Cyan
+            $script:SSHServer = Start-SSHTestContainer
+            
+            if ($null -eq $script:SSHServer) {
+                Write-Warning "Failed to start SSH test container"
+                $script:DockerAvailable = $false
+            }
+        }
+        else {
+            Write-Warning "Docker not available - SSH tests will be skipped"
+        }
+    }
+
+    BeforeDiscovery {
+        # Docker availability check for skip logic (evaluated during discovery phase)
+        $SSHHelperPath = Join-Path $PSScriptRoot 'SSHTestHelper.psm1'
+        Import-Module $SSHHelperPath -Force -ErrorAction SilentlyContinue
+        $DockerAvailable = Test-DockerAvailable
+    }
+
+    AfterAll {
+        if ($script:DockerAvailable -and $null -ne $script:SSHServer) {
+            Stop-SSHTestContainer
+        }
+        Remove-Module SSHTestHelper -Force -ErrorAction SilentlyContinue
+    }
+
+    Context 'SSH Connection Tests' -Skip:(-not $DockerAvailable) {
+        It 'Creates SSH session with password authentication' {
+            $cred = Get-SSHTestCredential -Server $script:SSHServer
+            
+            $session = New-PSHostSession `
+                -HostName $script:SSHServer.Host `
+                -Port $script:SSHServer.Port `
+                -UserName $script:SSHServer.UserName `
+                -Credential $cred `
+                -SSHTransport `
+                -SkipHostKeyCheck `
+                -ErrorAction Stop
+
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+                $session.Availability | Should -Be 'Available'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Executes remote command over SSH' {
+            $cred = Get-SSHTestCredential -Server $script:SSHServer
+            
+            $session = New-PSHostSession `
+                -HostName $script:SSHServer.Host `
+                -Port $script:SSHServer.Port `
+                -UserName $script:SSHServer.UserName `
+                -Credential $cred `
+                -SSHTransport `
+                -SkipHostKeyCheck `
+                -ErrorAction Stop
+
+            try {
+                $result = Invoke-Command -Session $session -ScriptBlock { 
+                    $PSVersionTable.PSVersion.Major 
+                } -ErrorAction Stop
+                
+                $result | Should -BeGreaterOrEqual 7
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Executes multiple commands in SSH session' {
+            $cred = Get-SSHTestCredential -Server $script:SSHServer
+            
+            $session = New-PSHostSession `
+                -HostName $script:SSHServer.Host `
+                -Port $script:SSHServer.Port `
+                -UserName $script:SSHServer.UserName `
+                -Credential $cred `
+                -SSHTransport `
+                -SkipHostKeyCheck `
+                -ErrorAction Stop
+
+            try {
+                $result1 = Invoke-Command -Session $session -ScriptBlock { 2 + 2 }
+                $result2 = Invoke-Command -Session $session -ScriptBlock { 5 * 5 }
+                $result3 = Invoke-Command -Session $session -ScriptBlock { "Hello" + "World" }
+                
+                $result1 | Should -Be 4
+                $result2 | Should -Be 25
+                $result3 | Should -Be "HelloWorld"
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Retrieves remote environment information over SSH' {
+            $cred = Get-SSHTestCredential -Server $script:SSHServer
+            
+            $session = New-PSHostSession `
+                -HostName $script:SSHServer.Host `
+                -Port $script:SSHServer.Port `
+                -UserName $script:SSHServer.UserName `
+                -Credential $cred `
+                -SSHTransport `
+                -SkipHostKeyCheck `
+                -ErrorAction Stop
+
+            try {
+                $info = Invoke-Command -Session $session -ScriptBlock { 
+                    [PSCustomObject]@{
+                        OS = $PSVersionTable.OS
+                        Platform = $PSVersionTable.Platform
+                        PSVersion = $PSVersionTable.PSVersion.ToString()
+                    }
+                } -ErrorAction Stop
+                
+                $info.OS | Should -Not -BeNullOrEmpty
+                $info.Platform | Should -Be 'Unix'
+                $info.PSVersion | Should -Match '^\d+\.\d+\.\d+'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Properly cleans up SSH session' {
+            $cred = Get-SSHTestCredential -Server $script:SSHServer
+            
+            $session = New-PSHostSession `
+                -HostName $script:SSHServer.Host `
+                -Port $script:SSHServer.Port `
+                -UserName $script:SSHServer.UserName `
+                -Credential $cred `
+                -SSHTransport `
+                -SkipHostKeyCheck `
+                -ErrorAction Stop
+
+            $sessionId = $session.Id
+            Remove-PSSession -Session $session -ErrorAction Stop
+            
+            # Verify session is removed
+            $remainingSession = Get-PSSession -Id $sessionId -ErrorAction SilentlyContinue
+            $remainingSession | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'SSH Error Handling' -Skip:(-not $DockerAvailable) {
+        It 'Throws error for invalid credentials' {
+            $badCred = [PSCredential]::new('testuser', (ConvertTo-SecureString 'wrongpassword' -AsPlainText -Force))
+            
+            { 
+                New-PSHostSession `
+                    -HostName $script:SSHServer.Host `
+                    -Port $script:SSHServer.Port `
+                    -UserName $script:SSHServer.UserName `
+                    -Credential $badCred `
+                    -SSHTransport `
+                    -SkipHostKeyCheck `
+                    -OpenTimeout 5000 `
+                    -ErrorAction Stop 
+            } | Should -Throw
+        }
+
+        It 'Throws timeout error when SSH server not reachable' {
+            $cred = [PSCredential]::new('testuser', (ConvertTo-SecureString 'testpass' -AsPlainText -Force))
+            
+            { 
+                New-PSHostSession `
+                    -HostName 'localhost' `
+                    -Port 59998 `
+                    -UserName 'testuser' `
+                    -Credential $cred `
+                    -SSHTransport `
+                    -SkipHostKeyCheck `
+                    -OpenTimeout 2000 `
+                    -ErrorAction Stop 
+            } | Should -Throw
+        }
+    }
+}
+
+Describe 'SSH Transport with Docker' -Skip:(-not $script:SSHTestingEnabled) {
+    BeforeAll {
+        $sshHelperPath = Join-Path $PSScriptRoot 'SSHTestHelper.psm1'
+        if (Test-Path $sshHelperPath) {
+            Import-Module $sshHelperPath -Force -ErrorAction Stop
+        }
+
+        Write-Host "Setting up SSH Docker container for testing..." -ForegroundColor Yellow
+        
+        # Build the SSH test image
+        $buildResult = Build-SSHTestImage
+        if (-not $buildResult) {
+            throw "Failed to build SSH test Docker image"
+        }
+        
+        # Start SSH test container
+        $script:sshServer = Start-SSHTestContainer
+        if ($null -eq $script:sshServer) {
+            throw "Failed to start SSH test container"
+        }
+        
+        Write-Host "SSH test container ready at $($script:sshServer.Host):$($script:sshServer.Port)" -ForegroundColor Green
+    }
+    
+    AfterAll {
+        # Cleanup SSH container
+        if ($script:sshServer) {
+            Write-Host "Cleaning up SSH test container..." -ForegroundColor Yellow
+            Stop-SSHTestContainer
+        }
+        Remove-Module SSHTestHelper -Force -ErrorAction SilentlyContinue
+    }
+    
+    It 'Should connect via SSH with password authentication' {
+        $cred = [PSCredential]::new($script:sshServer.UserName, (ConvertTo-SecureString $script:sshServer.Password -AsPlainText -Force))
+        
+        $session = New-PSHostSession `
+            -HostName $script:sshServer.Host `
+            -Port $script:sshServer.Port `
+            -UserName $script:sshServer.UserName `
+            -Credential $cred `
+            -SSHTransport `
+            -SkipHostKeyCheck `
+            -OpenTimeout 10000
+        
+        try {
+            $session | Should -Not -BeNullOrEmpty
+            $session.State | Should -Be 'Opened'
+            
+            # Test basic command execution
+            $result = Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.ToString() }
+            $result | Should -Not -BeNullOrEmpty
+        }
+        finally {
+            Remove-PSHostSessionSafely -Session $session
+        }
+    }
+    
+    It 'Should execute commands in SSH session' {
+        $cred = [PSCredential]::new($script:sshServer.UserName, (ConvertTo-SecureString $script:sshServer.Password -AsPlainText -Force))
+        
+        $session = New-PSHostSession `
+            -HostName $script:sshServer.Host `
+            -Port $script:sshServer.Port `
+            -UserName $script:sshServer.UserName `
+            -Credential $cred `
+            -SSHTransport `
+            -SkipHostKeyCheck
+        
+        try {
+            $result = Invoke-Command -Session $session -ScriptBlock { 
+                Get-ChildItem / | Select-Object -First 3 | Measure-Object | Select-Object -ExpandProperty Count
+            }
+            $result | Should -BeGreaterThan 0
+        }
+        finally {
+            Remove-PSHostSessionSafely -Session $session
         }
     }
 }

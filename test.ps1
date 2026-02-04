@@ -1,17 +1,13 @@
 # Build and test the module in a fresh PowerShell process
 
-# Build the module first
+# Build the module first using build.ps1
 Write-Host "Building module..." -ForegroundColor Cyan
-dotnet build -c Release -f net8.0
+& "$PSScriptRoot\build.ps1"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Build failed with exit code $LASTEXITCODE"
     exit $LASTEXITCODE
 }
-
-$OutputPath = "$PSScriptRoot\src\bin\Release\net8.0"
-$ModulePath = "$PSScriptRoot\AwakeCoding.PSRemoting"
-Copy-Item "$OutputPath\AwakeCoding.PSRemoting.PowerShell.dll" "$ModulePath\AwakeCoding.PSRemoting.PowerShell.dll" -Force
 
 Write-Host "Build completed successfully" -ForegroundColor Green
 Write-Host ""
