@@ -11,11 +11,19 @@ This is a **hybrid .NET/PowerShell module** that provides PowerShell remoting ca
 ## Key Components
 
 ### Client-Side Components
+- [`src/PSHostSessionCommandBase.cs`](../src/PSHostSessionCommandBase.cs) - Abstract base class for session cmdlets
+  - Shares parameters and connection logic across `New-PSHostSession` and `Enter-PSHostSession`
+  - Supports 6 parameter sets: Subprocess, TCP, WebSocket, NamedPipe, ProcessId, SSH
+  - Provides `CreateAndOpenRunspace()` method and transport-specific connection factories
 - [`src/PSHostSessionCommands.cs`](../src/PSHostSessionCommands.cs) - Client cmdlets for creating sessions
-  - `NewPSHostSessionCommand` - Creates PSSessions to local subprocesses
+  - `NewPSHostSessionCommand` - Creates PSSessions to local subprocesses (extends base class)
+  - `EnterPSHostSessionCommand` - Creates and enters sessions interactively (extends base class)
   - `ConnectPSHostProcessCommand` - Connects to existing PowerShell processes via named pipes
 - [`src/PSHostClientTransport.cs`](../src/PSHostClientTransport.cs) - Client transport using Process stdio
 - [`src/PSHostNamedPipeTransport.cs`](../src/PSHostNamedPipeTransport.cs) - Named pipe client transport
+- [`src/PSHostTcpClientTransport.cs`](../src/PSHostTcpClientTransport.cs) - TCP client transport
+- [`src/PSHostWebSocketClientTransport.cs`](../src/PSHostWebSocketClientTransport.cs) - WebSocket client transport
+- [`src/PSHostSSHClientTransport.cs`](../src/PSHostSSHClientTransport.cs) - SSH client transport
 
 ### Server-Side Components
 - [`src/PSHostServerCommands.cs`](../src/PSHostServerCommands.cs) - **Unified server cmdlets** (3 cmdlets for all transports)
@@ -31,7 +39,7 @@ This is a **hybrid .NET/PowerShell module** that provides PowerShell remoting ca
 ### Shared Components
 - [`src/PowerShellFinder.cs`](../src/PowerShellFinder.cs) - Utilities to locate PowerShell executables and generate pipe names
 - [`src/PSHostTcpServerTransport.cs`](../src/PSHostTcpServerTransport.cs) - Internal TCP transport connection info and manager (server-side)
-- [`AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1`](../AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1) - Module manifest (exports 5 cmdlets total)
+- [`AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1`](../AwakeCoding.PSRemoting/AwakeCoding.PSRemoting.psd1) - Module manifest (exports 6 cmdlets total)
 
 ### Deprecated Files
 - [`src/PSHostSession.cs`](../src/PSHostSession.cs) - Deprecated code wrapped in `#if false` (types moved to other files, kept for reference)
@@ -93,13 +101,25 @@ Enter-PSSession -HostName localhost -Port 8080
 
 ## Common Patterns
 
+### Shared Base Class Architecture
+
+Client session cmdlets (`New-PSHostSession` and `Enter-PSHostSession`) inherit from `PSHostSessionCommandBase` to share:
+- **All parameters**: Subprocess, TCP, WebSocket, NamedPipe, ProcessId, and SSH parameter sets
+- **Connection logic**: Transport-specific connection info factory methods
+- **Runspace opening**: `CreateAndOpenRunspace()` handles async open, timeout, and readiness checks
+- **Derived implementation**: Each cmdlet implements `ProcessSession(Runspace)` for specific behavior
+  - `NewPSHostSessionCommand.ProcessSession()` → Creates and outputs PSSession object
+  - `EnterPSHostSessionCommand.ProcessSession()` → Creates PSSession and calls built-in `Enter-PSSession`
+
+This pattern eliminates ~283 lines of duplicated code and ensures parameter consistency.
+
 ### Adding New Cmdlet Parameters
 
-For client cmdlets:
-- Add as properties to the cmdlet class (e.g., `NewPSHostSessionCommand`)
-- Mark with `[Parameter()]` attribute
+For client session cmdlets:
+- Add properties to `PSHostSessionCommandBase` to share across both cmdlets
+- Mark with `[Parameter()]` attribute and specify applicable parameter sets
 - Use `[ValidateNotNullOrEmpty()]` for mandatory string parameters
-- Access via properties in `BeginProcessing()` method
+- Access via properties in `CreateAndOpenRunspace()` or connection factory methods
 
 For server cmdlets:
 - Unified cmdlets use `-TransportType` enum to select transport
