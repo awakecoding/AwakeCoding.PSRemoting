@@ -458,6 +458,8 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
                 $exitCode = $script:UpdateHostProcess.ExitCode
                 throw "Update test host process exited immediately with code $exitCode"
             }
+
+            $script:UpdateCmdletOpenTimeout = 15000
         }
 
         AfterAll {
@@ -479,7 +481,7 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
         }
 
         It 'Supports -WhatIf and reports skipped status for target process' {
-            $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -WhatIf
+            $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -WhatIf
 
             $result | Should -Not -BeNullOrEmpty
             $result.ProcessId | Should -Be $script:UpdateHostPID
@@ -493,7 +495,7 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
             $varValue = "VALUE_$([Guid]::NewGuid().ToString('N').Substring(0,8))"
 
             try {
-                $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -Environment @{ $varName = $varValue }
+                $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -Environment @{ $varName = $varValue }
 
                 $result | Should -Not -BeNullOrEmpty
                 $result.ProcessId | Should -Be $script:UpdateHostPID
@@ -515,7 +517,7 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
                 }
             }
             finally {
-                $cleanup = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -Environment @{ $varName = $null }
+                $cleanup = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -Environment @{ $varName = $null }
                 $cleanup.Status | Should -BeIn @('Applied', 'Skipped')
             }
         }
@@ -524,8 +526,8 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
             $varName = "PSTEST_UPDATE_REMOVE_$([Guid]::NewGuid().ToString('N'))"
             $varValue = "VALUE_$([Guid]::NewGuid().ToString('N').Substring(0,8))"
 
-            Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -Environment @{ $varName = $varValue } | Out-Null
-            $removeResult = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -Environment @{ $varName = $null }
+            Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -Environment @{ $varName = $varValue } | Out-Null
+            $removeResult = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -Environment @{ $varName = $null }
 
             $removeResult.Status | Should -Be 'Applied'
             $removeResult.Mode | Should -Be 'Explicit'
@@ -546,7 +548,7 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
         }
 
         It 'Runs refresh mode by default when -Environment is not provided' {
-            $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID
+            $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout
 
             $result | Should -Not -BeNullOrEmpty
             $result.ProcessId | Should -Be $script:UpdateHostPID
