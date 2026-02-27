@@ -82,6 +82,10 @@ Describe 'Module Manifest Tests' {
         $Manifest.ExportedCmdlets.Keys | Should -Contain 'New-PSHostSession'
     }
 
+    It 'Exports the Update-PSHostProcessEnvironment cmdlet' {
+        $Manifest.ExportedCmdlets.Keys | Should -Contain 'Update-PSHostProcessEnvironment'
+    }
+
     It 'Requires PowerShell Core' {
         $Manifest.CompatiblePSEditions | Should -Contain 'Core'
     }
@@ -423,6 +427,139 @@ Describe 'Connect-PSHostProcess Cmdlet Tests' {
     # Custom Pipe Host tests removed due to lack of public server API
 }
 
+Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
+    Context 'Module Export' {
+        It 'Exports the Update-PSHostProcessEnvironment cmdlet' {
+            $Manifest = Test-ModuleManifest -Path (Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) 'AwakeCoding.PSRemoting') 'AwakeCoding.PSRemoting.psd1') -ErrorAction Stop
+            $Manifest.ExportedCmdlets.Keys | Should -Contain 'Update-PSHostProcessEnvironment'
+        }
+    }
+
+    Context 'Remote Execution with Background Host' {
+        BeforeAll {
+            $script:updatePsi = [System.Diagnostics.ProcessStartInfo]::new()
+            $script:updatePsi.FileName = (Get-Command pwsh).Source
+            $script:updatePsi.Arguments = '-NoLogo -NoProfile -NoExit'
+            $script:updatePsi.UseShellExecute = $false
+            $script:updatePsi.CreateNoWindow = $true
+            $script:updatePsi.RedirectStandardInput = $true
+            $script:updatePsi.RedirectStandardOutput = $true
+            $script:updatePsi.RedirectStandardError = $true
+
+            $script:UpdateHostProcess = [System.Diagnostics.Process]::Start($script:updatePsi)
+            $script:UpdateHostPID = $script:UpdateHostProcess.Id
+
+            $script:updateStdoutTask = $script:UpdateHostProcess.StandardOutput.ReadToEndAsync()
+            $script:updateStderrTask = $script:UpdateHostProcess.StandardError.ReadToEndAsync()
+
+            Start-Sleep -Milliseconds 3000
+
+            if ($script:UpdateHostProcess.HasExited) {
+                $exitCode = $script:UpdateHostProcess.ExitCode
+                throw "Update test host process exited immediately with code $exitCode"
+            }
+
+            $script:UpdateCmdletOpenTimeout = 15000
+        }
+
+        AfterAll {
+            try {
+                if ($script:UpdateHostProcess -and -not $script:UpdateHostProcess.HasExited) {
+                    $script:UpdateHostProcess.StandardInput.Close()
+                    if (-not $script:UpdateHostProcess.WaitForExit(1000)) {
+                        $script:UpdateHostProcess.Kill()
+                    }
+                }
+            }
+            catch {}
+
+            try { $script:UpdateHostProcess.Dispose() } catch {}
+        }
+
+        AfterEach {
+            Start-Sleep -Milliseconds 500
+        }
+
+        It 'Supports -WhatIf and reports skipped status for target process' {
+            $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -WhatIf
+
+            $result | Should -Not -BeNullOrEmpty
+            $result.ProcessId | Should -Be $script:UpdateHostPID
+            $result.Status | Should -Be 'Skipped'
+            $result.Mode | Should -Be 'Refresh'
+            $result.Reason | Should -Be 'Skipped by ShouldProcess'
+        }
+
+        It 'Applies explicit environment variables with -Environment hashtable' {
+            $varName = "PSTEST_UPDATE_ENV_$([Guid]::NewGuid().ToString('N'))"
+            $varValue = "VALUE_$([Guid]::NewGuid().ToString('N').Substring(0,8))"
+
+            try {
+                $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -Environment @{ $varName = $varValue }
+
+                $result | Should -Not -BeNullOrEmpty
+                $result.ProcessId | Should -Be $script:UpdateHostPID
+                $result.Status | Should -Be 'Applied'
+                $result.Mode | Should -Be 'Explicit'
+                $result.AppliedCount | Should -Be 1
+
+                $session = Connect-PSHostProcess -Id $script:UpdateHostPID
+                try {
+                    $remoteValue = Invoke-Command -Session $session -ScriptBlock {
+                        param($name)
+                        [System.Environment]::GetEnvironmentVariable($name, 'Process')
+                    } -ArgumentList $varName -ErrorAction Stop
+
+                    $remoteValue | Should -Be $varValue
+                }
+                finally {
+                    Remove-PSHostSessionSafely -Session $session
+                }
+            }
+            finally {
+                $cleanup = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -Environment @{ $varName = $null }
+                $cleanup.Status | Should -BeIn @('Applied', 'Skipped')
+            }
+        }
+
+        It 'Removes explicit environment variable when value is null' {
+            $varName = "PSTEST_UPDATE_REMOVE_$([Guid]::NewGuid().ToString('N'))"
+            $varValue = "VALUE_$([Guid]::NewGuid().ToString('N').Substring(0,8))"
+
+            Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -Environment @{ $varName = $varValue } | Out-Null
+            $removeResult = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout -Environment @{ $varName = $null }
+
+            $removeResult.Status | Should -Be 'Applied'
+            $removeResult.Mode | Should -Be 'Explicit'
+            $removeResult.AppliedCount | Should -Be 1
+
+            $session = Connect-PSHostProcess -Id $script:UpdateHostPID
+            try {
+                $remoteValue = Invoke-Command -Session $session -ScriptBlock {
+                    param($name)
+                    [System.Environment]::GetEnvironmentVariable($name, 'Process')
+                } -ArgumentList $varName -ErrorAction Stop
+
+                $remoteValue | Should -BeNullOrEmpty
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Runs refresh mode by default when -Environment is not provided' {
+            $result = Update-PSHostProcessEnvironment -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout
+
+            $result | Should -Not -BeNullOrEmpty
+            $result.ProcessId | Should -Be $script:UpdateHostPID
+            $result.Mode | Should -Be 'Refresh'
+            $result.Status | Should -BeIn @('Updated', 'AlreadyCurrent')
+            $result.WasUpToDate | Should -BeOfType [bool]
+            $result.DriftCount | Should -BeOfType [int]
+        }
+    }
+}
+
 
 Describe 'Unified Server Cmdlet Tests' {
     Context 'Module Exports' {
@@ -579,16 +716,19 @@ Describe 'Unified Server Cmdlet Tests' {
         }
 
         It 'Starts a WebSocket server successfully' {
-            $server = Start-PSHostServer -TransportType WebSocket -Port 8080
+            $port = Get-Random -Minimum 20000 -Maximum 40000
+            $server = Start-PSHostServer -TransportType WebSocket -Port $port
             try {
                 $server | Should -Not -BeNullOrEmpty
                 $server.State | Should -Be 'Running'
-                $server.Port | Should -Be 8080
+                $server.Port | Should -Be $port
                 $server.Path | Should -Be '/pwsh'
                 $server.UseSecureConnection | Should -Be $false
             }
             finally {
-                Stop-PSHostServer -Server $server -Force
+                if ($null -ne $server) {
+                    Stop-PSHostServer -Server $server -Force
+                }
             }
         }
 
