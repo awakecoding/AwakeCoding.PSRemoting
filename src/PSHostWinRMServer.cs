@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Management.Automation;
+using System.Linq;
 using System.Net;
 using System.Text;
 using System.Threading;
@@ -21,9 +23,14 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         private Process? _process;
         private readonly BlockingCollection<string> _stdoutQueue;
+        private readonly List<string> _deferredStdoutLines = new();
+        private readonly object _stdoutLock = new();
         private Thread? _stdoutReaderThread;
         private Thread? _stderrReaderThread;
         private volatile bool _disposed;
+        public string? CurrentCommandPipelineGuid { get; set; }
+        // Fragment GUID tracker for reconstructing <Data> elements sent to subprocess stdin
+        internal readonly Dictionary<ulong, string> FragmentGuids = new();
 
         public WinRMShell(string shellId, Process process)
         {
@@ -70,20 +77,66 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// Try to dequeue a line from stdout within the given timeout.
         /// Returns null if the timeout expires or the shell has closed.
         /// </summary>
-        public string? TryDequeueStdoutLine(int timeoutMs)
+        public string? TryDequeueStdoutLine(int timeoutMs, Func<string, bool>? predicate = null)
         {
             if (_disposed) return null;
-            try
+
+            if (TryTakeDeferredLine(predicate, out string? deferredLine))
+                return deferredLine;
+
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+
+            while (!_disposed)
             {
-                if (_stdoutQueue.TryTake(out string? line, timeoutMs))
-                    return line;
-                return null;
+                int remainingMs = timeoutMs < 0
+                    ? Timeout.Infinite
+                    : Math.Max(0, (int)(deadline - DateTime.UtcNow).TotalMilliseconds);
+                if (timeoutMs >= 0 && remainingMs == 0)
+                    return null;
+
+                try
+                {
+                    if (!_stdoutQueue.TryTake(out string? line, remainingMs))
+                        return null;
+
+                    if (predicate == null || predicate(line))
+                        return line;
+
+                    lock (_stdoutLock)
+                    {
+                        _deferredStdoutLines.Add(line);
+                    }
+
+                    if (TryTakeDeferredLine(predicate, out deferredLine))
+                        return deferredLine;
+                }
+                catch (InvalidOperationException)
+                {
+                    return null;
+                }
             }
-            catch (InvalidOperationException)
+
+            return null;
+        }
+
+        private bool TryTakeDeferredLine(Func<string, bool>? predicate, out string? line)
+        {
+            lock (_stdoutLock)
             {
-                // Collection was marked completed
-                return null;
+                for (int i = 0; i < _deferredStdoutLines.Count; i++)
+                {
+                    string candidate = _deferredStdoutLines[i];
+                    if (predicate == null || predicate(candidate))
+                    {
+                        _deferredStdoutLines.RemoveAt(i);
+                        line = candidate;
+                        return true;
+                    }
+                }
             }
+
+            line = null;
+            return false;
         }
 
         private void ReadStdout()
@@ -388,7 +441,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 if (action.EndsWith("/Transfer/Create", StringComparison.OrdinalIgnoreCase) ||
                     action == WsManXml.ActionCreate)
                 {
-                    responseXml = HandleCreate(ctx.Request);
+                    responseXml = HandleCreate(requestBody, ctx.Request);
                 }
                 else if (action == WsManXml.ActionSend)
                 {
@@ -397,6 +450,14 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 else if (action == WsManXml.ActionReceive)
                 {
                     responseXml = HandleReceive(requestBody);
+                }
+                else if (action == WsManXml.ActionCommand)
+                {
+                    responseXml = HandleCommand(requestBody);
+                }
+                else if (action == WsManXml.ActionSignal)
+                {
+                    responseXml = HandleSignal(requestBody);
                 }
                 else if (action == WsManXml.ActionDelete ||
                          action.EndsWith("/Transfer/Delete", StringComparison.OrdinalIgnoreCase))
@@ -468,7 +529,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             return string.Empty;
         }
 
-        private string HandleCreate(HttpListenerRequest request)
+        private string HandleCreate(string soapXml, HttpListenerRequest request)
         {
             string shellId = Guid.NewGuid().ToString().ToUpper();
 
@@ -490,6 +551,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
             var shell = new WinRMShell(shellId, process);
             shell.StartReaders();
             _shells[shellId] = shell;
+
+            string? creationXml = ParseCreationXmlFromCreateRequest(soapXml);
+            if (!string.IsNullOrWhiteSpace(creationXml))
+            {
+                string dataLine = WsManXml.WrapInDataElement(creationXml, shell.FragmentGuids);
+                shell.WriteToStdin(dataLine);
+            }
 
             // Track the connection
             string clientEndpoint = request.RemoteEndPoint?.ToString() ?? "unknown";
@@ -519,16 +587,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     string? base64Data = stream.Value;
                     if (string.IsNullOrEmpty(base64Data)) continue;
 
-                    byte[] bytes = Convert.FromBase64String(base64Data);
-                    string text = Encoding.UTF8.GetString(bytes);
-
-                    // Write each line to stdin (text already ends with \n from client encoding)
-                    foreach (string line in text.Split('\n'))
-                    {
-                        string trimmed = line.TrimEnd('\r');
-                        if (!string.IsNullOrEmpty(trimmed))
-                            shell.WriteToStdin(trimmed);
-                    }
+                    // The SOAP stream carries base64 binary PSRP fragment.
+                    // Reconstruct the stdio <Data> wrapper that pwsh expects on stdin.
+                    string dataLine = WsManXml.WrapInDataElement(base64Data, shell.FragmentGuids);
+                    shell.WriteToStdin(dataLine);
                 }
             }
             catch (Exception ex)
@@ -548,7 +610,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
             // Wait up to 500ms for the first stdout line, then return what we have.
             // The client retries immediately on an empty response; a short timeout keeps
             // latency low without busy-looping on the server side.
-            string? firstLine = shell.TryDequeueStdoutLine(timeoutMs: 500);
+            string? requestedCommandId = ParseCommandIdFromReceiveRequest(soapXml);
+            string? firstLine = shell.TryDequeueStdoutLine(timeoutMs: 500, predicate: line => MatchesRequestedCommand(line, requestedCommandId, shell.CurrentCommandPipelineGuid));
 
             var lines = new System.Collections.Generic.List<string>();
             if (firstLine != null)
@@ -557,7 +620,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                 // Drain any additional immediately-available lines (non-blocking)
                 string? extraLine;
-                while ((extraLine = shell.TryDequeueStdoutLine(0)) != null)
+                while ((extraLine = shell.TryDequeueStdoutLine(0, predicate: line => MatchesRequestedCommand(line, requestedCommandId, shell.CurrentCommandPipelineGuid))) != null)
                     lines.Add(extraLine);
             }
 
@@ -586,6 +649,53 @@ namespace AwakeCoding.PSRemoting.PowerShell
             return BuildDeleteResponse();
         }
 
+        private string HandleCommand(string soapXml)
+        {
+            // RunCommand: start the PSRP command within the shell. The first PSRP fragment for the
+            // pipeline arrives in <rsp:Arguments>, so replay both the pipeline creation marker and
+            // the initial fragment into pwsh stdin.
+            string? shellId = ParseShellIdFromRequest(soapXml);
+            if (shellId == null || !_shells.TryGetValue(shellId, out var shell))
+                throw new InvalidOperationException($"Shell not found: {shellId}");
+
+            try
+            {
+                var doc = XDocument.Parse(soapXml);
+                XNamespace rsp = WsManXml.NsRsp;
+
+                var commandLine = doc.Descendants(rsp + "CommandLine").FirstOrDefault();
+                string? commandId = (string?)commandLine?.Attribute("CommandId");
+                string? arguments = commandLine?.Element(rsp + "Arguments")?.Value;
+
+                if (!string.IsNullOrWhiteSpace(commandId))
+                {
+                    shell.CurrentCommandPipelineGuid = commandId;
+                    shell.WriteToStdin($"<Command PSGuid='{commandId}' />");
+
+                    if (!string.IsNullOrWhiteSpace(arguments))
+                    {
+                        string dataLine = WsManXml.WrapInDataElement(arguments.Trim(), shell.FragmentGuids);
+                        shell.WriteToStdin(dataLine);
+                    }
+                }
+
+                // Return ShellId as CommandId so subsequent Send/Receive requests can continue
+                // using the single-shell model implemented by this lightweight server.
+                return BuildCommandResponse(shellId);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"Failed to process Command request: {ex.Message}", ex);
+            }
+        }
+
+        private static string HandleSignal(string soapXml)
+        {
+            // Signal is sent to terminate a running command. We treat it as a no-op
+            // since our server's command lifecycle is tied to the shell (Delete handles cleanup).
+            return BuildSignalResponse();
+        }
+
         private static string? ParseShellIdFromRequest(string soapXml)
         {
             try
@@ -602,6 +712,70 @@ namespace AwakeCoding.PSRemoting.PowerShell
             catch { }
 
             return null;
+        }
+
+        private static string? ParseCommandIdFromReceiveRequest(string soapXml)
+        {
+            try
+            {
+                var doc = XDocument.Parse(soapXml);
+                XNamespace rsp = WsManXml.NsRsp;
+                return doc.Descendants(rsp + "DesiredStream")
+                    .Select(el => (string?)el.Attribute("CommandId"))
+                    .FirstOrDefault(id => !string.IsNullOrWhiteSpace(id));
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string? ParseCreationXmlFromCreateRequest(string soapXml)
+        {
+            try
+            {
+                var doc = XDocument.Parse(soapXml);
+                var creationElement = doc.Descendants().FirstOrDefault(el =>
+                    string.Equals(el.Name.LocalName, "creationXml", StringComparison.OrdinalIgnoreCase));
+                return string.IsNullOrWhiteSpace(creationElement?.Value) ? null : creationElement.Value.Trim();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool MatchesRequestedCommand(string line, string? requestedCommandId, string? currentCommandPipelineGuid)
+        {
+            string? lineCommandId = ExtractPsGuidFromOutputLine(line);
+            if (string.IsNullOrWhiteSpace(requestedCommandId))
+            {
+                return string.IsNullOrWhiteSpace(lineCommandId) ||
+                    string.Equals(lineCommandId, Guid.Empty.ToString(), StringComparison.OrdinalIgnoreCase);
+            }
+
+            string expectedGuid = !string.IsNullOrWhiteSpace(currentCommandPipelineGuid)
+                ? currentCommandPipelineGuid
+                : requestedCommandId;
+            return string.Equals(lineCommandId, expectedGuid, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? ExtractPsGuidFromOutputLine(string line)
+        {
+            int idx = line.IndexOf("PSGuid='", StringComparison.OrdinalIgnoreCase);
+            char quote = '\'';
+            if (idx < 0)
+            {
+                idx = line.IndexOf("PSGuid=\"", StringComparison.OrdinalIgnoreCase);
+                quote = '"';
+            }
+
+            if (idx < 0)
+                return null;
+
+            int start = idx + 8;
+            int end = line.IndexOf(quote, start);
+            return end > start ? line.Substring(start, end - start) : null;
         }
 
         private static void SendHttpResponse(
@@ -676,8 +850,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
             foreach (string line in stdoutLines)
             {
-                // Encode line + \n so client decodes to complete PSRP lines
-                string base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(line + "\n"));
+                // pwsh stdout emits: <Data Stream='Default' PSGuid='GUID'>BASE64</Data>
+                // WinRM SOAP streams carry only the BASE64 binary fragment.
+                string base64 = WsManXml.ExtractBase64FromDataElement(line);
                 sb.Append($"<rsp:Stream Name=\"stdout\" CommandId=\"{shellId}\">{base64}</rsp:Stream>");
             }
 
@@ -691,6 +866,32 @@ namespace AwakeCoding.PSRemoting.PowerShell
             return $"<s:Envelope {SoapNs}>" +
                    "<s:Header>" +
                    $"<wsa:Action>http://schemas.xmlsoap.org/ws/2004/09/transfer/DeleteResponse</wsa:Action>" +
+                   $"<wsa:MessageID>uuid:{msgId}</wsa:MessageID>" +
+                   "</s:Header>" +
+                   "<s:Body/>" +
+                   "</s:Envelope>";
+        }
+
+        private static string BuildCommandResponse(string commandId)
+        {
+            string msgId = Guid.NewGuid().ToString().ToUpper();
+            return $"<s:Envelope {SoapNs}>" +
+                   "<s:Header>" +
+                   $"<wsa:Action>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/CommandResponse</wsa:Action>" +
+                   $"<wsa:MessageID>uuid:{msgId}</wsa:MessageID>" +
+                   "</s:Header>" +
+                   "<s:Body>" +
+                   $"<rsp:CommandResponse><rsp:CommandId>{commandId}</rsp:CommandId></rsp:CommandResponse>" +
+                   "</s:Body>" +
+                   "</s:Envelope>";
+        }
+
+        private static string BuildSignalResponse()
+        {
+            string msgId = Guid.NewGuid().ToString().ToUpper();
+            return $"<s:Envelope {SoapNs}>" +
+                   "<s:Header>" +
+                   $"<wsa:Action>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/SignalResponse</wsa:Action>" +
                    $"<wsa:MessageID>uuid:{msgId}</wsa:MessageID>" +
                    "</s:Header>" +
                    "<s:Body/>" +

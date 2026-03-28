@@ -30,6 +30,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         protected RunspaceConnectionInfo? _connectionInfo;
         protected Runspace? _runspace;
         protected ManualResetEvent? _openAsync;
+        protected DateTime _runspaceOpenStart;
 
         #region Subprocess Parameters
 
@@ -153,10 +154,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
         public SwitchParameter UseSSL { get; set; }
 
         /// <summary>
-        /// Authentication mechanism for WinRM (Default = Basic).
+        /// Authentication mechanism for WinRM (Default = Negotiate).
         /// </summary>
         [Parameter(ParameterSetName = WinRMParameterSet)]
-        public WinRMAuthenticationMechanism Authentication { get; set; } = WinRMAuthenticationMechanism.Basic;
+        public WinRMAuthenticationMechanism Authentication { get; set; } = WinRMAuthenticationMechanism.Negotiate;
 
         /// <summary>
         /// Allow HTTP redirects for WinRM connections.
@@ -170,6 +171,14 @@ namespace AwakeCoding.PSRemoting.PowerShell
         [Parameter(ParameterSetName = WinRMParameterSet)]
         [ValidateNotNullOrEmpty()]
         public string ApplicationName { get; set; } = "/wsman";
+
+        /// <summary>
+        /// PowerShell session configuration name (default "Microsoft.PowerShell").
+        /// Use "PowerShell.7" to connect to a PS7 endpoint.
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMParameterSet)]
+        [ValidateNotNullOrEmpty()]
+        public string ConfigurationName { get; set; } = WsManXml.DefaultConfigurationName;
 
         #endregion
 
@@ -272,18 +281,20 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 name: RunspaceName);
 
             _openAsync = new ManualResetEvent(false);
+            _runspaceOpenStart = DateTime.UtcNow;
             _runspace.StateChanged += HandleRunspaceStateChanged;
 
             try
             {
                 _runspace.OpenAsync();
 
-                // Wait for runspace to reach Opened/Closed/Broken state with timeout
-                if (!_openAsync.WaitOne(OpenTimeout))
+                // Wait for runspace to reach Opened/Closed/Broken state with timeout.
+                int effectiveTimeout = Math.Max(OpenTimeout, _connectionInfo.OpenTimeout);
+                if (!_openAsync.WaitOne(effectiveTimeout))
                 {
                     // Timeout - clean up and throw
                     try { _runspace.Dispose(); } catch { }
-                    throw new TimeoutException($"Runspace open timed out after {OpenTimeout}ms");
+                    throw new TimeoutException($"Runspace open timed out after {effectiveTimeout}ms");
                 }
 
                 // Check if runspace opened successfully
@@ -449,6 +460,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 Authentication = Authentication,
                 Credential = Credential,
                 ApplicationName = ApplicationName,
+                ConfigurationName = ConfigurationName,
                 AllowRedirection = AllowRedirection,
                 OpenTimeout = OpenTimeout
             };
@@ -463,7 +475,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         protected void HandleRunspaceStateChanged(object? source, RunspaceStateEventArgs stateEventArgs)
         {
-            switch (stateEventArgs.RunspaceStateInfo.State)
+            var state = stateEventArgs.RunspaceStateInfo.State;
+            WinRMTrace.WriteLine($"[WINRM-DBG +{(DateTime.UtcNow - _runspaceOpenStart).TotalMilliseconds:F0}ms] RUNSPACE STATE: {state}  Reason={stateEventArgs.RunspaceStateInfo.Reason?.Message}");
+            switch (state)
             {
                 case RunspaceState.Opened:
                 case RunspaceState.Closed:
