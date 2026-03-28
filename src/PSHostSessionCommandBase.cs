@@ -20,6 +20,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         protected const string NamedPipeParameterSet = "NamedPipe";
         protected const string ProcessIdParameterSet = "ProcessId";
         protected const string SSHParameterSet = "SSH";
+        protected const string WinRMParameterSet = "WinRM";
 
         protected const int DefaultOpenTimeoutMs = 30000;
         protected const int DefaultReadinessTimeoutMs = 5000;
@@ -52,15 +53,17 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// </summary>
         [Parameter(ParameterSetName = TcpParameterSet, Mandatory = true)]
         [Parameter(ParameterSetName = SSHParameterSet, Mandatory = true, Position = 0)]
+        [Parameter(ParameterSetName = WinRMParameterSet, Mandatory = true)]
         [ValidateNotNullOrEmpty()]
         [Alias("ComputerName")]
         public string? HostName { get; set; }
 
         /// <summary>
-        /// Port number. Required for TCP, optional for SSH (default 22).
+        /// Port number. Required for TCP, optional for SSH (default 22) and WinRM (default 5985/5986).
         /// </summary>
         [Parameter(ParameterSetName = TcpParameterSet, Mandatory = true)]
         [Parameter(ParameterSetName = SSHParameterSet)]
+        [Parameter(ParameterSetName = WinRMParameterSet)]
         [ValidateRange(1, 65535)]
         public int Port { get; set; }
 
@@ -122,6 +125,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// Credential for SSH password authentication
         /// </summary>
         [Parameter(ParameterSetName = SSHParameterSet)]
+        [Parameter(ParameterSetName = WinRMParameterSet)]
         [Credential()]
         public PSCredential? Credential { get; set; }
 
@@ -130,6 +134,42 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// </summary>
         [Parameter(ParameterSetName = SSHParameterSet)]
         public SwitchParameter SkipHostKeyCheck { get; set; }
+
+        #endregion
+
+        #region WinRM Parameters
+
+        /// <summary>
+        /// Switch to indicate WinRM transport should be used.
+        /// Required to disambiguate WinRM from TCP/SSH when using -HostName.
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMParameterSet, Mandatory = true)]
+        public SwitchParameter WinRMTransport { get; set; }
+
+        /// <summary>
+        /// Use HTTPS for WinRM (port 5986 by default).
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMParameterSet)]
+        public SwitchParameter UseSSL { get; set; }
+
+        /// <summary>
+        /// Authentication mechanism for WinRM (Default = Basic).
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMParameterSet)]
+        public WinRMAuthenticationMechanism Authentication { get; set; } = WinRMAuthenticationMechanism.Basic;
+
+        /// <summary>
+        /// Allow HTTP redirects for WinRM connections.
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMParameterSet)]
+        public SwitchParameter AllowRedirection { get; set; }
+
+        /// <summary>
+        /// WSMan application name (default "/wsman").
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMParameterSet)]
+        [ValidateNotNullOrEmpty()]
+        public string ApplicationName { get; set; } = "/wsman";
 
         #endregion
 
@@ -210,6 +250,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 case SSHParameterSet:
                     _connectionInfo = CreateSSHConnectionInfo();
                     TransportName ??= "SSH";
+                    break;
+
+                case WinRMParameterSet:
+                    _connectionInfo = CreateWinRMConnectionInfo();
+                    TransportName ??= "WinRM";
                     break;
 
                 case SubprocessParameterSet:
@@ -364,7 +409,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         private RunspaceConnectionInfo CreateSSHConnectionInfo()
         {
-            // Use the new SSHClientInfo with thread-based transport for interactive console passthrough
+// Use the new SSHClientInfo with thread-based transport for interactive console passthrough
             var connectionInfo = new SSHClientInfo(
                 computerName: HostName!,
                 userName: UserName,
@@ -389,6 +434,24 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
             // Pass PSHost for interactive prompting
             connectionInfo.PSHost = Host;
+
+            return connectionInfo;
+        }
+
+        private RunspaceConnectionInfo CreateWinRMConnectionInfo()
+        {
+            int port = Port > 0 ? Port : (UseSSL ? 5986 : 5985);
+
+            var connectionInfo = new WinRMClientInfo(HostName!)
+            {
+                Port = port,
+                UseSSL = UseSSL,
+                Authentication = Authentication,
+                Credential = Credential,
+                ApplicationName = ApplicationName,
+                AllowRedirection = AllowRedirection,
+                OpenTimeout = OpenTimeout
+            };
 
             return connectionInfo;
         }

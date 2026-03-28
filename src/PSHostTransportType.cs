@@ -18,6 +18,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// <summary>
         /// Named Pipe transport
         /// </summary>
-        NamedPipe
+        NamedPipe,
+
+        /// <summary>
+        /// WinRM (WSMan over HTTP/HTTPS) transport
+        /// </summary>
+        WinRM
     }
 }
