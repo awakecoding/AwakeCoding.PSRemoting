@@ -1,6 +1,6 @@
 # AwakeCoding PSRemoting Extensions
 
-PowerShell remoting without network transport - create local PowerShell sessions via subprocess stdio, and host remoting endpoints via TCP, WebSocket, or Named Pipes.
+PowerShell remoting without WinRM listener dependencies - create PowerShell sessions via subprocess stdio or custom transports, and host remoting endpoints via TCP, WebSocket, Named Pipe, or WinRM.
 
 ## Installation
 
@@ -11,7 +11,8 @@ Install-Module AwakeCoding.PSRemoting
 ## Features
 
 - **Client Sessions**: Create PSSession objects connected to local PowerShell subprocesses
-- **Server Infrastructure**: Host PowerShell remoting endpoints on TCP, WebSocket, or Named Pipe transports
+- **Custom WinRM Transport**: Connect to PowerShell over WSMan/WinRM using the module's own HTTP/SOAP transport
+- **Server Infrastructure**: Host PowerShell remoting endpoints on TCP, WebSocket, Named Pipe, or WinRM transports
 - **Process Connection**: Connect to existing PowerShell processes via named pipes
 - **Cross-Platform**: Works on Windows, Linux, and macOS
 
@@ -53,6 +54,9 @@ Enter-PSHostSession -ProcessId 12345
 
 # SSH connection
 Enter-PSHostSession -SSHTransport -HostName remote-server
+
+# WinRM connection
+Enter-PSHostSession -ComputerName remote-server -Authentication Negotiate
 ```
 
 ## Creating Sessions Without Entering
@@ -153,6 +157,66 @@ WSManStackVersion              3.0
 ```
 
 This can be useful to have a script running using the latest PowerShell that can drive executions in multiple older versions of PowerShell through local PSRemoting.
+
+## WinRM Transport - Remote PowerShell Over WSMan
+
+The `New-PSHostSession` cmdlet also supports a transport-owned WinRM implementation built on `HttpClient` and WSMan SOAP requests. This does not depend on PowerShell's built-in WSMan client stack, which makes it useful when you want more control over authentication and wire behavior.
+
+### Basic WinRM Connection
+
+```powershell
+# HTTP / default WSMan endpoint (prompts for credentials by default)
+$session = New-PSHostSession -ComputerName 'server01'
+
+# HTTPS / port 5986
+$session = New-PSHostSession -ComputerName 'server01' -UseSSL
+
+# Specify an explicit port and enter the session
+$session = New-PSHostSession -ComputerName 'server01' -Port 5985
+$session | Enter-PSSession
+
+# Explicit WinRM endpoint URI
+$session = New-PSHostSession -ConnectionUri 'http://server01:5985/wsman'
+```
+
+### Authentication and Configuration
+
+```powershell
+# Prompt for credentials and use Negotiate (default)
+$session = New-PSHostSession -ComputerName 'server01'
+
+# Supply a PSCredential explicitly
+$cred = Get-Credential -UserName 'Administrator'
+$session = New-PSHostSession -ComputerName 'server01' -Credential $cred
+
+# Supply the user name separately and prompt only for the password
+$session = New-PSHostSession -ComputerName 'server01' -UserName 'Administrator'
+
+# Supply the user name and password separately
+$password = Read-Host 'Password' -AsSecureString
+$session = New-PSHostSession -ComputerName 'server01' `
+    -UserName 'Administrator' `
+    -Password $password
+
+# On Windows only, opt into the current logon token
+$session = New-PSHostSession -ComputerName 'server01' -UseImplicitCredential
+
+# Basic auth against a lab endpoint
+$session = New-PSHostSession -ComputerName 'server01' `
+    -Authentication Basic `
+    -Credential $cred
+
+# Custom configuration endpoint and application path
+$session = New-PSHostSession -ComputerName 'server01' `
+    -ConfigurationName 'PowerShell.7' `
+    -ApplicationName '/wsman'
+```
+
+Negotiate and Kerberos use a transport-owned SSPI layer. The module prefers the packaged `Devolutions.Sspi` runtime on every platform, and on Windows it automatically falls back to native Windows SSPI if that bundled runtime cannot be loaded.
+
+WinRM now expects explicit credentials by default. If you omit `-Credential`, the cmdlet prompts for credentials. You can also provide `-UserName` on its own to prefill the prompt, or pair `-UserName` with `-Password` to avoid constructing a `PSCredential` yourself. To use the current Windows logon token instead, opt in with `-UseImplicitCredential`. This implicit mode is Windows-only and is not valid with `-Authentication Basic`.
+
+Use `-ComputerName` or `-ConnectionUri` for WinRM. Use `-SSHTransport -HostName` for SSH. This matches PowerShell's built-in transport split while still reserving plain `-HostName -Port` for the custom TCP transport in this module.
 
 ## SSH Transport - Remote PowerShell Over SSH
 
@@ -291,6 +355,24 @@ $server = Start-PSHostServer -TransportType NamedPipe
 $server = Start-PSHostServer -TransportType NamedPipe -PipeName 'MyCustomPipe'
 ```
 
+### Start-PSHostServer - WinRM Transport
+
+Start a lightweight WinRM/WSMan listener backed by a PowerShell subprocess:
+
+```powershell
+# Start a WinRM listener on the default /wsman path
+$server = Start-PSHostServer -TransportType WinRM -Port 5985
+
+# Start on a custom path
+$server = Start-PSHostServer -TransportType WinRM -Port 5986 -WinRMPath '/custom-wsman'
+
+# Require Basic authentication with an explicit credential
+$cred = Get-Credential -UserName 'lab\administrator'
+$server = Start-PSHostServer -TransportType WinRM -Port 5987 -Credential $cred
+```
+
+You can connect to that listener with `New-PSHostSession -ComputerName ...` or `-ConnectionUri ...`, or by using any WSMan client that can target the hosted endpoint path.
+
 ### Managing Servers
 
 ```powershell
@@ -299,6 +381,9 @@ Get-PSHostServer
 
 # Filter by transport type
 Get-PSHostServer -TransportType TCP
+
+# List WinRM listeners
+Get-PSHostServer -TransportType WinRM
 
 # Stop server by name
 Stop-PSHostServer -Name 'PSHostTcpServer8080'

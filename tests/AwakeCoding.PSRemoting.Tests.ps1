@@ -49,6 +49,112 @@ BeforeAll {
             }
         }
     }
+
+    function script:New-TestPSCredential {
+        param(
+            [Parameter(Mandatory)]
+            [string]$UserName,
+
+            [Parameter(Mandatory)]
+            [string]$Password
+        )
+
+        return [PSCredential]::new(
+            $UserName,
+            (ConvertTo-SecureString $Password -AsPlainText -Force))
+    }
+
+    function script:New-TestWinRMSession {
+        param(
+            [string]$ComputerName = 'localhost',
+
+            [int]$Port,
+
+            [string]$ConnectionUri,
+
+            [Parameter(Mandatory)]
+            [PSCredential]$Credential,
+
+            [int]$OpenTimeout = 60000,
+
+            [int]$MaxAttempts = 2,
+
+            [int]$RetryDelayMilliseconds = 1000
+        )
+
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            try {
+                if ($PSBoundParameters.ContainsKey('ConnectionUri')) {
+                    return New-PSHostSession -ConnectionUri $ConnectionUri -Credential $Credential -OpenTimeout $OpenTimeout -ErrorAction Stop
+                }
+
+                return New-PSHostSession -ComputerName $ComputerName -Port $Port -Credential $Credential -OpenTimeout $OpenTimeout -ErrorAction Stop
+            }
+            catch [System.TimeoutException] {
+                if ($attempt -ge $MaxAttempts) {
+                    throw
+                }
+
+                Start-Sleep -Milliseconds $RetryDelayMilliseconds
+            }
+        }
+    }
+
+    function script:Invoke-TestCommandWithTimeout {
+        param(
+            [Parameter(Mandatory)]
+            [System.Management.Automation.Runspaces.PSSession]$Session,
+
+            [Parameter(Mandatory)]
+            [scriptblock]$ScriptBlock,
+
+            [object[]]$ArgumentList,
+
+            [int]$TimeoutSeconds = 30
+        )
+
+        $job = $null
+
+        if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) {
+            $job = Start-ThreadJob -ScriptBlock {
+                param($RemoteSession, $RemoteScriptBlock, $RemoteArgumentList)
+
+                Invoke-Command -Session $RemoteSession -ScriptBlock $RemoteScriptBlock -ArgumentList $RemoteArgumentList -ErrorAction Stop
+            } -ArgumentList $Session, $ScriptBlock, $ArgumentList
+        }
+        else {
+            $job = Invoke-Command -Session $Session -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -AsJob
+        }
+
+        try {
+            $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+            if ($null -eq $completed) {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+                throw "Invoke-Command timed out after ${TimeoutSeconds}s"
+            }
+
+            return Receive-Job -Job $job -Wait -AutoRemoveJob -ErrorAction Stop
+        }
+        finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    function script:Invoke-TestWinRMConnectionInfo {
+        param(
+            [Parameter(Mandatory)]
+            [scriptblock]$Configure
+        )
+
+        $command = [AwakeCoding.PSRemoting.PowerShell.NewPSHostSessionCommand]::new()
+        & $Configure $command
+
+        $method = $command.GetType().BaseType.GetMethod(
+            'CreateWinRMConnectionInfo',
+            [System.Reflection.BindingFlags]'Instance, NonPublic')
+
+        return $method.Invoke($command, @())
+    }
 }
 
 AfterAll {
@@ -96,6 +202,20 @@ Describe 'Module Manifest Tests' {
 }
 
 Describe 'New-PSHostSession Cmdlet Tests' {
+    Context 'Parameter Surface' {
+        It 'Exposes WinRM via ComputerName and ConnectionUri instead of WinRMTransport' {
+            $command = Get-Command New-PSHostSession
+
+            $command.Parameters.ContainsKey('ComputerName') | Should -BeTrue
+            $command.Parameters.ContainsKey('ConnectionUri') | Should -BeTrue
+            $command.Parameters.ContainsKey('UserName') | Should -BeTrue
+            $command.Parameters.ContainsKey('Password') | Should -BeTrue
+            $command.Parameters.ContainsKey('UseImplicitCredential') | Should -BeTrue
+            $command.Parameters.ContainsKey('AuthenticationProvider') | Should -BeFalse
+            $command.Parameters.ContainsKey('WinRMTransport') | Should -BeFalse
+        }
+    }
+
     Context 'Basic Functionality' {
         It 'Creates a PSSession successfully' {
             $session = New-PSHostSession
@@ -503,7 +623,7 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
                 $result.Mode | Should -Be 'Explicit'
                 $result.AppliedCount | Should -Be 1
 
-                $session = Connect-PSHostProcess -Id $script:UpdateHostPID
+                $session = Connect-PSHostProcess -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout
                 try {
                     $remoteValue = Invoke-Command -Session $session -ScriptBlock {
                         param($name)
@@ -533,7 +653,7 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
             $removeResult.Mode | Should -Be 'Explicit'
             $removeResult.AppliedCount | Should -Be 1
 
-            $session = Connect-PSHostProcess -Id $script:UpdateHostPID
+            $session = Connect-PSHostProcess -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout
             try {
                 $remoteValue = Invoke-Command -Session $session -ScriptBlock {
                     param($name)
@@ -845,10 +965,60 @@ Describe 'Unified Server Cmdlet Tests' {
         }
     }
 
-    Context 'Mixed Transport Tests' {
+    Context 'WinRM Server Tests' {
         AfterEach {
-            Get-PSHostServer -ErrorAction SilentlyContinue | Stop-PSHostServer -Force -ErrorAction SilentlyContinue
+            Get-PSHostServer -TransportType WinRM -ErrorAction SilentlyContinue | Stop-PSHostServer -Force -ErrorAction SilentlyContinue
         }
+
+        It 'Can start and stop a WinRM server' {
+            $server = Start-PSHostServer -TransportType WinRM -Port 19855
+            try {
+                $server | Should -Not -BeNullOrEmpty
+                $server.State | Should -Be 'Running'
+                $server.Port | Should -Be 19855
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+            $server.State | Should -Be 'Stopped'
+        }
+
+        It 'WinRM server has expected properties' {
+            $server = Start-PSHostServer -TransportType WinRM -Port 19856
+            try {
+                $server.Port | Should -Be 19856
+                $server.ListenerPrefix | Should -Match 'http://127.0.0.1:19856/'
+                $server | Should -BeOfType 'AwakeCoding.PSRemoting.PowerShell.PSHostWinRMServer'
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Throws error if WinRM port is duplicate' {
+            $server = Start-PSHostServer -TransportType WinRM -Port 19857
+            try {
+                { Start-PSHostServer -TransportType WinRM -Port 19857 -ErrorAction Stop } | Should -Throw
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+
+        It 'Can retrieve WinRM server with TransportType filter' {
+            $server = Start-PSHostServer -TransportType WinRM -Port 19858
+            try {
+                $found = Get-PSHostServer -TransportType WinRM
+                $found | Should -HaveCount 1
+                $found.Port | Should -Be 19858
+            }
+            finally {
+                Stop-PSHostServer -Server $server -Force
+            }
+        }
+    }
+
+    Context 'Mixed Transport Tests' {
 
         It 'Can run all three transport types simultaneously' {
             $tcpServer = Start-PSHostServer -TransportType TCP -Port 0
@@ -1046,6 +1216,155 @@ Describe 'End-to-End Client Transport Tests' {
 
         It 'Throws timeout error when named pipe does not exist' {
             { New-PSHostSession -PipeName 'NonExistentPipe12345' -OpenTimeout 2000 -ErrorAction Stop } | Should -Throw
+        }
+    }
+
+    Context 'WinRM Client Info' {
+        It 'Clones the WinRM implicit credential flag' {
+            $info = [AwakeCoding.PSRemoting.PowerShell.WinRMClientInfo]::new('server01')
+            $info.UseImplicitCredential = $true
+
+            $clone = $info.Clone()
+
+            $clone.UseImplicitCredential | Should -BeTrue
+        }
+
+        It 'Builds WinRM credentials from UserName and Password' {
+            $info = Invoke-TestWinRMConnectionInfo {
+                param($command)
+
+                $command.ComputerName = 'server02'
+                $command.UserName = 'CONTOSO\User01'
+                $command.Password = ConvertTo-SecureString 'Secret123!' -AsPlainText -Force
+            }
+
+            $info.Credential | Should -Not -BeNullOrEmpty
+            $info.Credential.UserName | Should -Be 'CONTOSO\User01'
+            $info.Credential.GetNetworkCredential().Password | Should -Be 'Secret123!'
+            $info.UseImplicitCredential | Should -BeFalse
+        }
+
+        It 'Rejects Password without UserName for WinRM' {
+            {
+                Invoke-TestWinRMConnectionInfo {
+                    param($command)
+
+                    $command.ComputerName = 'server03'
+                    $command.Password = ConvertTo-SecureString 'Secret123!' -AsPlainText -Force
+                }
+            } | Should -Throw -ExpectedMessage '*Specify -UserName when using -Password*'
+        }
+
+        It 'Rejects Credential combined with UserName for WinRM' {
+            {
+                Invoke-TestWinRMConnectionInfo {
+                    param($command)
+
+                    $command.ComputerName = 'server04'
+                    $command.Credential = New-TestPSCredential -UserName 'user' -Password 'pass'
+                    $command.UserName = 'other-user'
+                }
+            } | Should -Throw -ExpectedMessage '*Do not combine -Credential with -UserName or -Password*'
+        }
+
+        It 'Requires prompt-capable host when WinRM credentials are omitted' {
+            {
+                Invoke-TestWinRMConnectionInfo {
+                    param($command)
+
+                    $command.ComputerName = 'server05'
+                }
+            } | Should -Throw -ExpectedMessage '*WinRM connections require explicit credentials by default*'
+        }
+
+        It 'Rejects WinRM implicit credentials with Basic authentication' {
+            {
+                Invoke-TestWinRMConnectionInfo {
+                    param($command)
+
+                    $command.ComputerName = 'server06'
+                    $command.Authentication = [AwakeCoding.PSRemoting.PowerShell.WinRMAuthenticationMechanism]::Basic
+                    $command.UseImplicitCredential = $true
+                }
+            } | Should -Throw -ExpectedMessage '*implicit credentials cannot be used with Basic authentication*'
+        }
+    }
+
+    Context 'WinRM Client Transport' {
+        BeforeAll {
+            $script:WinRMPort = Get-Random -Minimum 22000 -Maximum 24000
+            $script:WinRMServer = Start-PSHostServer -TransportType WinRM -Port $script:WinRMPort -Name 'WinRME2ETest'
+            $script:WinRMCredential = New-TestPSCredential -UserName 'winrm-user' -Password 'winrm-pass'
+            $script:WinRMOpenTimeout = 60000
+            $script:WinRMCommandTimeoutSeconds = 30
+        }
+
+        AfterAll {
+            Stop-PSHostServer -Server $script:WinRMServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Connects to WinRM server and creates session' {
+            $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Executes commands over WinRM transport' {
+            $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
+            try {
+                $result = Invoke-TestCommandWithTimeout -Session $session -ArgumentList 5 -TimeoutSeconds $script:WinRMCommandTimeoutSeconds -ScriptBlock {
+                    param($x)
+
+                    [pscustomobject]@{
+                        Sum = 6 + 7
+                        MajorVersion = $PSVersionTable.PSVersion.Major
+                        Triple = $x * 3
+                    }
+                }
+
+                $result.Sum | Should -Be 13
+                $result.MajorVersion | Should -BeGreaterOrEqual 7
+                $result.Triple | Should -Be 15
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Connects to WinRM server using ConnectionUri' {
+            $session = New-TestWinRMSession -ConnectionUri "http://localhost:$($script:WinRMPort)/wsman" -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Rejects connection with wrong credentials when auth is enabled' {
+            $requiredCred = New-TestPSCredential -UserName 'user' -Password 'goodpass'
+            $wrongCred = New-TestPSCredential -UserName 'user' -Password 'badpass'
+            $serverWithAuth = Start-PSHostServer -TransportType WinRM -Port ($script:WinRMPort + 1) -Credential $requiredCred
+            try {
+                {
+                    New-PSHostSession `
+                        -ComputerName 'localhost' `
+                        -Port ($script:WinRMPort + 1) `
+                        -Authentication Basic `
+                        -Credential $wrongCred `
+                        -OpenTimeout 5000 `
+                        -ErrorAction Stop
+                } | Should -Throw
+            }
+            finally {
+                Stop-PSHostServer -Server $serverWithAuth -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }

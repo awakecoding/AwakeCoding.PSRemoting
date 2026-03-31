@@ -1,5 +1,13 @@
 
-dotnet build -c Release -f net8.0
+dotnet restore .\src\AwakeCoding.PSRemoting.PowerShell.csproj
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+dotnet build -c Release -f net8.0 --no-restore
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 $OutputPath = "$PSScriptRoot\src\bin\Release\net8.0"
 $ModulePath = "$PSScriptRoot\AwakeCoding.PSRemoting"
@@ -29,6 +37,17 @@ foreach ($dll in $Dependencies) {
     } else {
         Write-Warning "Dependency not found: $dll"
     }
+}
+
+$RuntimesPath = Join-Path $OutputPath 'runtimes'
+if (Test-Path $RuntimesPath) {
+    $ModuleRuntimesPath = Join-Path $ModulePath 'runtimes'
+    if (Test-Path $ModuleRuntimesPath) {
+        Remove-Item $ModuleRuntimesPath -Recurse -Force
+    }
+
+    Copy-Item $RuntimesPath $ModulePath -Recurse -Force
+    Write-Host "Copied: runtimes\"
 }
 
 Write-Host "`nModule files copied to: $ModulePath" -ForegroundColor Green

@@ -5,6 +5,8 @@ using System.Management.Automation;
 using System.Management.Automation.Internal;
 using System.Management.Automation.Remoting;
 using System.Management.Automation.Runspaces;
+using System.Runtime.InteropServices;
+using System.Security;
 using System.Threading;
 
 namespace AwakeCoding.PSRemoting.PowerShell
@@ -20,6 +22,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
         protected const string NamedPipeParameterSet = "NamedPipe";
         protected const string ProcessIdParameterSet = "ProcessId";
         protected const string SSHParameterSet = "SSH";
+        protected const string WinRMComputerNameParameterSet = "WinRMComputerName";
+        protected const string WinRMConnectionUriParameterSet = "WinRMConnectionUri";
 
         protected const int DefaultOpenTimeoutMs = 30000;
         protected const int DefaultReadinessTimeoutMs = 5000;
@@ -29,6 +33,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         protected RunspaceConnectionInfo? _connectionInfo;
         protected Runspace? _runspace;
         protected ManualResetEvent? _openAsync;
+        protected DateTime _runspaceOpenStart;
 
         #region Subprocess Parameters
 
@@ -53,14 +58,14 @@ namespace AwakeCoding.PSRemoting.PowerShell
         [Parameter(ParameterSetName = TcpParameterSet, Mandatory = true)]
         [Parameter(ParameterSetName = SSHParameterSet, Mandatory = true, Position = 0)]
         [ValidateNotNullOrEmpty()]
-        [Alias("ComputerName")]
         public string? HostName { get; set; }
 
         /// <summary>
-        /// Port number. Required for TCP, optional for SSH (default 22).
+        /// Port number. Required for TCP, optional for SSH (default 22) and WinRM (default 5985/5986).
         /// </summary>
         [Parameter(ParameterSetName = TcpParameterSet, Mandatory = true)]
         [Parameter(ParameterSetName = SSHParameterSet)]
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
         [ValidateRange(1, 65535)]
         public int Port { get; set; }
 
@@ -76,9 +81,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
         public SwitchParameter SSHTransport { get; set; }
 
         /// <summary>
-        /// SSH user name (can include domain, e.g., "Administrator@domain")
+        /// SSH or WinRM user name (can include domain, e.g., "Administrator@domain").
         /// </summary>
         [Parameter(ParameterSetName = SSHParameterSet)]
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        [Parameter(ParameterSetName = WinRMConnectionUriParameterSet)]
         [ValidateNotNullOrEmpty()]
         public string? UserName { get; set; }
 
@@ -122,6 +129,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// Credential for SSH password authentication
         /// </summary>
         [Parameter(ParameterSetName = SSHParameterSet)]
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        [Parameter(ParameterSetName = WinRMConnectionUriParameterSet)]
         [Credential()]
         public PSCredential? Credential { get; set; }
 
@@ -130,6 +139,75 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// </summary>
         [Parameter(ParameterSetName = SSHParameterSet)]
         public SwitchParameter SkipHostKeyCheck { get; set; }
+
+        #endregion
+
+        #region WinRM Parameters
+
+        /// <summary>
+        /// Target computer name for WinRM connections.
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet, Mandatory = true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        public string? ComputerName { get; set; }
+
+        /// <summary>
+        /// WinRM endpoint URI (for example, http://server01:5985/wsman).
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMConnectionUriParameterSet, Mandatory = true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        public Uri? ConnectionUri { get; set; }
+
+        /// <summary>
+        /// Use HTTPS for WinRM (port 5986 by default).
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        public SwitchParameter UseSSL { get; set; }
+
+        /// <summary>
+        /// Authentication mechanism for WinRM (Default = Negotiate).
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        [Parameter(ParameterSetName = WinRMConnectionUriParameterSet)]
+        public WinRMAuthenticationMechanism Authentication { get; set; } = WinRMAuthenticationMechanism.Negotiate;
+
+        /// <summary>
+        /// WinRM password to combine with -UserName when you do not want to construct a PSCredential yourself.
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        [Parameter(ParameterSetName = WinRMConnectionUriParameterSet)]
+        [ValidateNotNull()]
+        public SecureString? Password { get; set; }
+
+        /// <summary>
+        /// Use the current Windows logon token for WinRM Negotiate/Kerberos instead of prompting for explicit credentials.
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        [Parameter(ParameterSetName = WinRMConnectionUriParameterSet)]
+        public SwitchParameter UseImplicitCredential { get; set; }
+
+        /// <summary>
+        /// Allow HTTP redirects for WinRM connections.
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        [Parameter(ParameterSetName = WinRMConnectionUriParameterSet)]
+        public SwitchParameter AllowRedirection { get; set; }
+
+        /// <summary>
+        /// WSMan application name (default "/wsman").
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        [ValidateNotNullOrEmpty()]
+        public string ApplicationName { get; set; } = "/wsman";
+
+        /// <summary>
+        /// PowerShell session configuration name (default "Microsoft.PowerShell").
+        /// Use "PowerShell.7" to connect to a PS7 endpoint.
+        /// </summary>
+        [Parameter(ParameterSetName = WinRMComputerNameParameterSet)]
+        [Parameter(ParameterSetName = WinRMConnectionUriParameterSet)]
+        [ValidateNotNullOrEmpty()]
+        public string ConfigurationName { get; set; } = WsManXml.DefaultConfigurationName;
 
         #endregion
 
@@ -212,6 +290,12 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     TransportName ??= "SSH";
                     break;
 
+                case WinRMComputerNameParameterSet:
+                case WinRMConnectionUriParameterSet:
+                    _connectionInfo = CreateWinRMConnectionInfo();
+                    TransportName ??= "WinRM";
+                    break;
+
                 case SubprocessParameterSet:
                 default:
                     _connectionInfo = CreateSubprocessConnectionInfo();
@@ -227,18 +311,20 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 name: RunspaceName);
 
             _openAsync = new ManualResetEvent(false);
+            _runspaceOpenStart = DateTime.UtcNow;
             _runspace.StateChanged += HandleRunspaceStateChanged;
 
             try
             {
                 _runspace.OpenAsync();
 
-                // Wait for runspace to reach Opened/Closed/Broken state with timeout
-                if (!_openAsync.WaitOne(OpenTimeout))
+                // Wait for runspace to reach Opened/Closed/Broken state with timeout.
+                int effectiveTimeout = Math.Max(OpenTimeout, _connectionInfo.OpenTimeout);
+                if (!_openAsync.WaitOne(effectiveTimeout))
                 {
                     // Timeout - clean up and throw
                     try { _runspace.Dispose(); } catch { }
-                    throw new TimeoutException($"Runspace open timed out after {OpenTimeout}ms");
+                    throw new TimeoutException($"Runspace open timed out after {effectiveTimeout}ms");
                 }
 
                 // Check if runspace opened successfully
@@ -364,7 +450,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         private RunspaceConnectionInfo CreateSSHConnectionInfo()
         {
-            // Use the new SSHClientInfo with thread-based transport for interactive console passthrough
+// Use the new SSHClientInfo with thread-based transport for interactive console passthrough
             var connectionInfo = new SSHClientInfo(
                 computerName: HostName!,
                 userName: UserName,
@@ -393,6 +479,138 @@ namespace AwakeCoding.PSRemoting.PowerShell
             return connectionInfo;
         }
 
+        private RunspaceConnectionInfo CreateWinRMConnectionInfo()
+        {
+            string computerName;
+            int port;
+            bool useSsl;
+            string applicationName;
+
+            if (ParameterSetName == WinRMConnectionUriParameterSet)
+            {
+                if (ConnectionUri == null)
+                {
+                    throw new ArgumentException("ConnectionUri is required for WinRM URI connections");
+                }
+
+                if (!ConnectionUri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)
+                    && !ConnectionUri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new ArgumentException($"Invalid WinRM URI scheme: {ConnectionUri.Scheme}. Expected 'http' or 'https'.");
+                }
+
+                applicationName = string.IsNullOrEmpty(ConnectionUri.AbsolutePath)
+                    ? "/wsman"
+                    : ConnectionUri.AbsolutePath;
+                computerName = ConnectionUri.Host;
+                port = ConnectionUri.IsDefaultPort ? 0 : ConnectionUri.Port;
+                useSsl = ConnectionUri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase);
+            }
+            else
+            {
+                computerName = ComputerName!;
+                port = Port > 0 ? Port : (UseSSL ? 5986 : 5985);
+                useSsl = UseSSL;
+                applicationName = ApplicationName;
+            }
+
+            (PSCredential? credential, bool useImplicitCredential) = ResolveWinRMCredential(computerName);
+
+            return new WinRMClientInfo(computerName)
+            {
+                Port = port,
+                UseSSL = useSsl,
+                Authentication = Authentication,
+                Credential = credential,
+                UseImplicitCredential = useImplicitCredential,
+                ApplicationName = applicationName,
+                ConfigurationName = ConfigurationName,
+                AllowRedirection = AllowRedirection,
+                OpenTimeout = OpenTimeout
+            };
+        }
+
+        private (PSCredential? Credential, bool UseImplicitCredential) ResolveWinRMCredential(string targetName)
+        {
+            bool hasCredential = Credential != null;
+            bool hasUserName = !string.IsNullOrWhiteSpace(UserName);
+            bool hasPassword = Password != null;
+
+            if (UseImplicitCredential)
+            {
+                if (Authentication == WinRMAuthenticationMechanism.Basic)
+                {
+                    throw new InvalidOperationException("WinRM implicit credentials cannot be used with Basic authentication.");
+                }
+
+                if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    throw new PlatformNotSupportedException("WinRM implicit credentials are only supported on Windows. Supply -Credential or -UserName with -Password instead.");
+                }
+
+                if (hasCredential || hasUserName || hasPassword)
+                {
+                    throw new InvalidOperationException("Do not combine -UseImplicitCredential with -Credential, -UserName, or -Password.");
+                }
+
+                return (null, true);
+            }
+
+            if (hasCredential)
+            {
+                if (hasUserName || hasPassword)
+                {
+                    throw new InvalidOperationException("Do not combine -Credential with -UserName or -Password for WinRM connections.");
+                }
+
+                return (Credential, false);
+            }
+
+            if (hasPassword && !hasUserName)
+            {
+                throw new InvalidOperationException("Specify -UserName when using -Password for WinRM connections.");
+            }
+
+            if (hasUserName && hasPassword)
+            {
+                return (new PSCredential(UserName!, Password!), false);
+            }
+
+            return (PromptForWinRMCredential(targetName), false);
+        }
+
+        private PSCredential PromptForWinRMCredential(string targetName)
+        {
+            if (Host?.UI == null)
+            {
+                throw new InvalidOperationException(
+                    "WinRM connections require explicit credentials by default. Supply -Credential or -UserName with -Password, or use -UseImplicitCredential on Windows.");
+            }
+
+            try
+            {
+                PSCredential? credential = Host.UI.PromptForCredential(
+                    caption: "WinRM Authentication",
+                    message: $"Enter credentials for the WinRM connection to '{targetName}'.",
+                    userName: UserName ?? string.Empty,
+                    targetName: targetName);
+
+                return credential ?? throw new InvalidOperationException("The WinRM credential prompt was cancelled.");
+            }
+            catch (System.Management.Automation.Host.HostException ex)
+            {
+                throw new InvalidOperationException(
+                    "WinRM connections require explicit credentials by default, but the current host cannot prompt for them. Supply -Credential or -UserName with -Password, or use -UseImplicitCredential on Windows.",
+                    ex);
+            }
+            catch (NotImplementedException ex)
+            {
+                throw new InvalidOperationException(
+                    "WinRM connections require explicit credentials by default, but the current host cannot prompt for them. Supply -Credential or -UserName with -Password, or use -UseImplicitCredential on Windows.",
+                    ex);
+            }
+        }
+
         protected override void StopProcessing()
         {
             ReleaseWait();
@@ -400,7 +618,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         protected void HandleRunspaceStateChanged(object? source, RunspaceStateEventArgs stateEventArgs)
         {
-            switch (stateEventArgs.RunspaceStateInfo.State)
+            var state = stateEventArgs.RunspaceStateInfo.State;
+            WinRMTrace.WriteLine($"[WINRM-DBG +{(DateTime.UtcNow - _runspaceOpenStart).TotalMilliseconds:F0}ms] RUNSPACE STATE: {state}  Reason={stateEventArgs.RunspaceStateInfo.Reason?.Message}");
+            switch (state)
             {
                 case RunspaceState.Opened:
                 case RunspaceState.Closed:

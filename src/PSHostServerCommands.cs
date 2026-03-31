@@ -8,7 +8,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
     /// Start-PSHostServer cmdlet - Starts a PowerShell remoting server with specified transport
     /// </summary>
     [Cmdlet(VerbsLifecycle.Start, "PSHostServer")]
-    [OutputType(typeof(PSHostTcpServer), typeof(PSHostWebSocketServer), typeof(PSHostNamedPipeServer))]
+    [OutputType(typeof(PSHostTcpServer), typeof(PSHostWebSocketServer), typeof(PSHostNamedPipeServer), typeof(PSHostWinRMServer))]
     public sealed class StartPSHostServerCommand : PSCmdlet
     {
         // Common parameters
@@ -50,6 +50,15 @@ namespace AwakeCoding.PSRemoting.PowerShell
         [ValidateNotNullOrEmpty()]
         public string? PipeName { get; set; }
 
+        // WinRM-specific parameters
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        public string WinRMPath { get; set; } = "/wsman";
+
+        [Parameter()]
+        [Credential()]
+        public PSCredential? Credential { get; set; }
+
         protected override void BeginProcessing()
         {
             PSHostServerBase server;
@@ -68,6 +77,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                     case PSHostTransportType.NamedPipe:
                         server = CreateNamedPipeServer();
+                        break;
+
+                    case PSHostTransportType.WinRM:
+                        server = CreateWinRMServer();
                         break;
 
                     default:
@@ -230,6 +243,37 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 maxConnections: MaxConnections,
                 drainTimeout: DrainTimeout);
         }
+
+        private PSHostWinRMServer CreateWinRMServer()
+        {
+            if (!Port.HasValue)
+                throw new ArgumentException("Port parameter is required for WinRM transport");
+
+            int portValue = Port.Value;
+
+            if (portValue == 0)
+                throw new ArgumentException("WinRM server requires a specific port (cannot be 0)");
+
+            if (string.IsNullOrWhiteSpace(Name))
+                Name = $"PSHostWinRMServer{portValue}";
+
+            var existingServer = PSHostServerBase.GetServer(Name);
+            if (existingServer != null)
+                throw new InvalidOperationException($"Server with name '{Name}' already exists");
+
+            var serverOnPort = PSHostServerBase.GetServerByPort(portValue);
+            if (serverOnPort != null)
+                throw new InvalidOperationException($"Server '{serverOnPort.Name}' is already listening on port {portValue}");
+
+            return new PSHostWinRMServer(
+                name: Name,
+                port: portValue,
+                listenAddress: ListenAddress,
+                path: WinRMPath,
+                maxConnections: MaxConnections,
+                drainTimeout: DrainTimeout,
+                requiredCredential: Credential);
+        }
     }
 
     /// <summary>
@@ -330,7 +374,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
     /// Get-PSHostServer cmdlet - Retrieves PowerShell remoting servers
     /// </summary>
     [Cmdlet(VerbsCommon.Get, "PSHostServer", DefaultParameterSetName = "All")]
-    [OutputType(typeof(PSHostTcpServer), typeof(PSHostWebSocketServer), typeof(PSHostNamedPipeServer))]
+    [OutputType(typeof(PSHostTcpServer), typeof(PSHostWebSocketServer), typeof(PSHostNamedPipeServer), typeof(PSHostWinRMServer))]
     public sealed class GetPSHostServerCommand : PSCmdlet
     {
         [Parameter(ParameterSetName = "ByName", Position = 0, Mandatory = true, ValueFromPipeline = true, ValueFromPipelineByPropertyName = true)]
@@ -408,6 +452,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                                 PSHostTransportType.TCP => allServers.OfType<PSHostTcpServer>(),
                                 PSHostTransportType.WebSocket => allServers.OfType<PSHostWebSocketServer>(),
                                 PSHostTransportType.NamedPipe => allServers.OfType<PSHostNamedPipeServer>(),
+                                PSHostTransportType.WinRM => allServers.OfType<PSHostWinRMServer>(),
                                 _ => allServers
                             };
                         }
