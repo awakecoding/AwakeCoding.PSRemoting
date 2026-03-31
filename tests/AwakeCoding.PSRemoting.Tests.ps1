@@ -64,6 +64,42 @@ BeforeAll {
             (ConvertTo-SecureString $Password -AsPlainText -Force))
     }
 
+    function script:New-TestWinRMSession {
+        param(
+            [string]$ComputerName = 'localhost',
+
+            [int]$Port,
+
+            [string]$ConnectionUri,
+
+            [Parameter(Mandatory)]
+            [PSCredential]$Credential,
+
+            [int]$OpenTimeout = 60000,
+
+            [int]$MaxAttempts = 2,
+
+            [int]$RetryDelayMilliseconds = 1000
+        )
+
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+            try {
+                if ($PSBoundParameters.ContainsKey('ConnectionUri')) {
+                    return New-PSHostSession -ConnectionUri $ConnectionUri -Credential $Credential -OpenTimeout $OpenTimeout -ErrorAction Stop
+                }
+
+                return New-PSHostSession -ComputerName $ComputerName -Port $Port -Credential $Credential -OpenTimeout $OpenTimeout -ErrorAction Stop
+            }
+            catch [System.TimeoutException] {
+                if ($attempt -ge $MaxAttempts) {
+                    throw
+                }
+
+                Start-Sleep -Milliseconds $RetryDelayMilliseconds
+            }
+        }
+    }
+
     function script:Invoke-TestWinRMConnectionInfo {
         param(
             [Parameter(Mandatory)]
@@ -1227,7 +1263,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Connects to WinRM server and creates session' {
-            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
+            $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
@@ -1238,7 +1274,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Executes arithmetic over WinRM transport' {
-            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
+            $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $result = Invoke-Command -Session $session -ScriptBlock { 6 + 7 } -ErrorAction Stop
                 $result | Should -Be 13
@@ -1249,7 +1285,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Retrieves PSVersionTable over WinRM' {
-            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
+            $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $version = Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -ErrorAction Stop
                 $version | Should -BeGreaterOrEqual 7
@@ -1260,7 +1296,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Passes arguments over WinRM' {
-            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
+            $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $result = Invoke-Command -Session $session -ScriptBlock { param($x) $x * 3 } -ArgumentList 5 -ErrorAction Stop
                 $result | Should -Be 15
@@ -1271,7 +1307,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Connects to WinRM server using ConnectionUri' {
-            $session = New-PSHostSession -ConnectionUri "http://localhost:$($script:WinRMPort)/wsman" -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
+            $session = New-TestWinRMSession -ConnectionUri "http://localhost:$($script:WinRMPort)/wsman" -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
