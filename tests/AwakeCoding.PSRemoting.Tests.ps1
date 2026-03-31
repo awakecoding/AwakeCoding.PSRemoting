@@ -100,6 +100,35 @@ BeforeAll {
         }
     }
 
+    function script:Invoke-TestCommandWithTimeout {
+        param(
+            [Parameter(Mandatory)]
+            [System.Management.Automation.Runspaces.PSSession]$Session,
+
+            [Parameter(Mandatory)]
+            [scriptblock]$ScriptBlock,
+
+            [object[]]$ArgumentList,
+
+            [int]$TimeoutSeconds = 30
+        )
+
+        $job = Invoke-Command -Session $Session -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -AsJob
+
+        try {
+            $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
+            if ($null -eq $completed) {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+                throw "Invoke-Command timed out after ${TimeoutSeconds}s"
+            }
+
+            return Receive-Job -Job $job -Wait -AutoRemoveJob -ErrorAction Stop
+        }
+        finally {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     function script:Invoke-TestWinRMConnectionInfo {
         param(
             [Parameter(Mandatory)]
@@ -1256,6 +1285,7 @@ Describe 'End-to-End Client Transport Tests' {
             $script:WinRMServer = Start-PSHostServer -TransportType WinRM -Port $script:WinRMPort -Name 'WinRME2ETest'
             $script:WinRMCredential = New-TestPSCredential -UserName 'winrm-user' -Password 'winrm-pass'
             $script:WinRMOpenTimeout = 60000
+            $script:WinRMCommandTimeoutSeconds = 30
         }
 
         AfterAll {
@@ -1276,7 +1306,7 @@ Describe 'End-to-End Client Transport Tests' {
         It 'Executes arithmetic over WinRM transport' {
             $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
-                $result = Invoke-Command -Session $session -ScriptBlock { 6 + 7 } -ErrorAction Stop
+                $result = Invoke-TestCommandWithTimeout -Session $session -ScriptBlock { 6 + 7 } -TimeoutSeconds $script:WinRMCommandTimeoutSeconds
                 $result | Should -Be 13
             }
             finally {
@@ -1287,7 +1317,7 @@ Describe 'End-to-End Client Transport Tests' {
         It 'Retrieves PSVersionTable over WinRM' {
             $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
-                $version = Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -ErrorAction Stop
+                $version = Invoke-TestCommandWithTimeout -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -TimeoutSeconds $script:WinRMCommandTimeoutSeconds
                 $version | Should -BeGreaterOrEqual 7
             }
             finally {
@@ -1298,7 +1328,7 @@ Describe 'End-to-End Client Transport Tests' {
         It 'Passes arguments over WinRM' {
             $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
-                $result = Invoke-Command -Session $session -ScriptBlock { param($x) $x * 3 } -ArgumentList 5 -ErrorAction Stop
+                $result = Invoke-TestCommandWithTimeout -Session $session -ScriptBlock { param($x) $x * 3 } -ArgumentList 5 -TimeoutSeconds $script:WinRMCommandTimeoutSeconds
                 $result | Should -Be 15
             }
             finally {
