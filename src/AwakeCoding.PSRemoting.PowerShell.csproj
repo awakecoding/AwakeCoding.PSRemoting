@@ -15,7 +15,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Devolutions.Sspi" Version="2026.3.27" />
+    <PackageReference Include="Devolutions.Sspi" Version="2026.3.27" ExcludeAssets="build;buildTransitive" />
     <PackageReference Include="System.Management.Automation" Version="7.4.*" PrivateAssets="all" />
     <PackageReference Include="System.Net.Http.WinHttpHandler" Version="*" />
     <PackageReference Include="Tmds.Ssh" Version="0.11.0" />

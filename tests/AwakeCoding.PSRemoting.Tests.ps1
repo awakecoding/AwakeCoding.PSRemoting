@@ -1219,6 +1219,7 @@ Describe 'End-to-End Client Transport Tests' {
             $script:WinRMPort = Get-Random -Minimum 22000 -Maximum 24000
             $script:WinRMServer = Start-PSHostServer -TransportType WinRM -Port $script:WinRMPort -Name 'WinRME2ETest'
             $script:WinRMCredential = New-TestPSCredential -UserName 'winrm-user' -Password 'winrm-pass'
+            $script:WinRMOpenTimeout = 60000
         }
 
         AfterAll {
@@ -1226,7 +1227,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Connects to WinRM server and creates session' {
-            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential
+            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'
@@ -1237,7 +1238,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Executes arithmetic over WinRM transport' {
-            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential
+            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $result = Invoke-Command -Session $session -ScriptBlock { 6 + 7 } -ErrorAction Stop
                 $result | Should -Be 13
@@ -1248,7 +1249,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Retrieves PSVersionTable over WinRM' {
-            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential
+            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $version = Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -ErrorAction Stop
                 $version | Should -BeGreaterOrEqual 7
@@ -1259,7 +1260,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Passes arguments over WinRM' {
-            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential
+            $session = New-PSHostSession -ComputerName 'localhost' -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $result = Invoke-Command -Session $session -ScriptBlock { param($x) $x * 3 } -ArgumentList 5 -ErrorAction Stop
                 $result | Should -Be 15
@@ -1270,7 +1271,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
 
         It 'Connects to WinRM server using ConnectionUri' {
-            $session = New-PSHostSession -ConnectionUri "http://localhost:$($script:WinRMPort)/wsman" -Credential $script:WinRMCredential
+            $session = New-PSHostSession -ConnectionUri "http://localhost:$($script:WinRMPort)/wsman" -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
                 $session | Should -Not -BeNullOrEmpty
                 $session.State | Should -Be 'Opened'

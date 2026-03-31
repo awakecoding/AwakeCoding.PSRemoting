@@ -1,6 +1,13 @@
 
 dotnet restore .\src\AwakeCoding.PSRemoting.PowerShell.csproj
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
 dotnet build -c Release -f net8.0 --no-restore
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
 
 $OutputPath = "$PSScriptRoot\src\bin\Release\net8.0"
 $ModulePath = "$PSScriptRoot\AwakeCoding.PSRemoting"
