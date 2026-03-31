@@ -113,7 +113,18 @@ BeforeAll {
             [int]$TimeoutSeconds = 30
         )
 
-        $job = Invoke-Command -Session $Session -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -AsJob
+        $job = $null
+
+        if (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue) {
+            $job = Start-ThreadJob -ScriptBlock {
+                param($RemoteSession, $RemoteScriptBlock, $RemoteArgumentList)
+
+                Invoke-Command -Session $RemoteSession -ScriptBlock $RemoteScriptBlock -ArgumentList $RemoteArgumentList -ErrorAction Stop
+            } -ArgumentList $Session, $ScriptBlock, $ArgumentList
+        }
+        else {
+            $job = Invoke-Command -Session $Session -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList -AsJob
+        }
 
         try {
             $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
