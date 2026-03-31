@@ -583,7 +583,7 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
                 $result.Mode | Should -Be 'Explicit'
                 $result.AppliedCount | Should -Be 1
 
-                $session = Connect-PSHostProcess -Id $script:UpdateHostPID
+                $session = Connect-PSHostProcess -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout
                 try {
                     $remoteValue = Invoke-Command -Session $session -ScriptBlock {
                         param($name)
@@ -613,7 +613,7 @@ Describe 'Update-PSHostProcessEnvironment Cmdlet Tests' {
             $removeResult.Mode | Should -Be 'Explicit'
             $removeResult.AppliedCount | Should -Be 1
 
-            $session = Connect-PSHostProcess -Id $script:UpdateHostPID
+            $session = Connect-PSHostProcess -Id $script:UpdateHostPID -OpenTimeout $script:UpdateCmdletOpenTimeout
             try {
                 $remoteValue = Invoke-Command -Session $session -ScriptBlock {
                     param($name)
