@@ -1303,33 +1303,22 @@ Describe 'End-to-End Client Transport Tests' {
             }
         }
 
-        It 'Executes arithmetic over WinRM transport' {
+        It 'Executes commands over WinRM transport' {
             $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
             try {
-                $result = Invoke-TestCommandWithTimeout -Session $session -ScriptBlock { 6 + 7 } -TimeoutSeconds $script:WinRMCommandTimeoutSeconds
-                $result | Should -Be 13
-            }
-            finally {
-                Remove-PSHostSessionSafely -Session $session
-            }
-        }
+                $result = Invoke-TestCommandWithTimeout -Session $session -ArgumentList 5 -TimeoutSeconds $script:WinRMCommandTimeoutSeconds -ScriptBlock {
+                    param($x)
 
-        It 'Retrieves PSVersionTable over WinRM' {
-            $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
-            try {
-                $version = Invoke-TestCommandWithTimeout -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -TimeoutSeconds $script:WinRMCommandTimeoutSeconds
-                $version | Should -BeGreaterOrEqual 7
-            }
-            finally {
-                Remove-PSHostSessionSafely -Session $session
-            }
-        }
+                    [pscustomobject]@{
+                        Sum = 6 + 7
+                        MajorVersion = $PSVersionTable.PSVersion.Major
+                        Triple = $x * 3
+                    }
+                }
 
-        It 'Passes arguments over WinRM' {
-            $session = New-TestWinRMSession -Port $script:WinRMPort -Credential $script:WinRMCredential -OpenTimeout $script:WinRMOpenTimeout
-            try {
-                $result = Invoke-TestCommandWithTimeout -Session $session -ScriptBlock { param($x) $x * 3 } -ArgumentList 5 -TimeoutSeconds $script:WinRMCommandTimeoutSeconds
-                $result | Should -Be 15
+                $result.Sum | Should -Be 13
+                $result.MajorVersion | Should -BeGreaterOrEqual 7
+                $result.Triple | Should -Be 15
             }
             finally {
                 Remove-PSHostSessionSafely -Session $session
