@@ -1,6 +1,6 @@
 # AwakeCoding PSRemoting Extensions
 
-PowerShell remoting without WinRM listener dependencies - create PowerShell sessions via subprocess stdio or custom transports, and host remoting endpoints via TCP, WebSocket, Named Pipe, or WinRM.
+PowerShell remoting without WinRM listener dependencies - create PowerShell sessions via subprocess stdio or custom transports, and host remoting endpoints via TCP, WebSocket, Named Pipe, gRPC, or WinRM.
 
 ## Installation
 
@@ -12,7 +12,7 @@ Install-Module AwakeCoding.PSRemoting
 
 - **Client Sessions**: Create PSSession objects connected to local PowerShell subprocesses
 - **Custom WinRM Transport**: Connect to PowerShell over WSMan/WinRM using the module's own HTTP/SOAP transport
-- **Server Infrastructure**: Host PowerShell remoting endpoints on TCP, WebSocket, Named Pipe, or WinRM transports
+- **Server Infrastructure**: Host PowerShell remoting endpoints on TCP, WebSocket, Named Pipe, gRPC, or WinRM transports
 - **Process Connection**: Connect to existing PowerShell processes via named pipes
 - **Cross-Platform**: Works on Windows, Linux, and macOS
 
@@ -45,6 +45,9 @@ Enter-PSHostSession -HostName remote-server -Port 8080
 
 # WebSocket connection
 Enter-PSHostSession -Uri ws://localhost:8080/pwsh
+
+# gRPC connection
+Enter-PSHostSession -GrpcUri grpc://localhost:8082
 
 # Named pipe connection
 Enter-PSHostSession -PipeName MyPipe
@@ -218,6 +221,40 @@ WinRM now expects explicit credentials by default. If you omit `-Credential`, th
 
 Use `-ComputerName` or `-ConnectionUri` for WinRM. Use `-SSHTransport -HostName` for SSH. This matches PowerShell's built-in transport split while still reserving plain `-HostName -Port` for the custom TCP transport in this module.
 
+## gRPC Transport - Remote PowerShell Over gRPC
+
+The `New-PSHostSession` and `Enter-PSHostSession` cmdlets support gRPC endpoints exposed by `Start-PSHostServer -TransportType Grpc`.
+
+```powershell
+# Start a loopback plaintext gRPC server on an automatically assigned port
+$server = Start-PSHostServer -TransportType Grpc -Port 0
+
+# Connect to the server from this or another PowerShell process
+$session = New-PSHostSession -GrpcUri $server.GrpcUri
+Invoke-Command -Session $session { $PSVersionTable.PSVersion }
+
+# Enter the session interactively
+Enter-PSHostSession -GrpcUri $server.GrpcUri
+```
+
+Use an explicit port when you need a stable endpoint:
+
+```powershell
+$server = Start-PSHostServer -TransportType Grpc -Port 8082
+$session = New-PSHostSession -GrpcUri 'grpc://localhost:8082'
+```
+
+Plaintext gRPC is limited to loopback by default. To bind a plaintext endpoint to a non-loopback address, pass `-AllowUnencrypted` explicitly:
+
+```powershell
+$server = Start-PSHostServer -TransportType Grpc `
+    -ListenAddress '0.0.0.0' `
+    -Port 8082 `
+    -AllowUnencrypted
+```
+
+The client URI must use the `grpc://` or `grpcs://` scheme and include a port. TLS server credentials for `grpcs://` are not implemented yet, so current server usage is plaintext gRPC. The gRPC transport depends on the `Grpc.Core` native runtime and is not supported on macOS arm64.
+
 ## SSH Transport - Remote PowerShell Over SSH
 
 The `New-PSHostSession` cmdlet supports SSH transport for connecting to remote PowerShell instances over SSH. This provides an alternative to WinRM-based remoting that works across platforms.
@@ -355,6 +392,22 @@ $server = Start-PSHostServer -TransportType NamedPipe
 $server = Start-PSHostServer -TransportType NamedPipe -PipeName 'MyCustomPipe'
 ```
 
+### Start-PSHostServer - gRPC Transport
+
+Start a gRPC server on a specific port (or use port 0 for auto-assignment):
+
+```powershell
+# Start loopback plaintext gRPC server on an automatically assigned port
+$server = Start-PSHostServer -TransportType Grpc -Port 0
+
+# Connect using the advertised URI
+$session = New-PSHostSession -GrpcUri $server.GrpcUri
+
+# Start on a stable port
+$server = Start-PSHostServer -TransportType Grpc -Port 8082
+$session = New-PSHostSession -GrpcUri 'grpc://localhost:8082'
+```
+
 ### Start-PSHostServer - WinRM Transport
 
 Start a lightweight WinRM/WSMan listener backed by a PowerShell subprocess:
@@ -385,6 +438,9 @@ Get-PSHostServer -TransportType TCP
 # List WinRM listeners
 Get-PSHostServer -TransportType WinRM
 
+# List gRPC listeners
+Get-PSHostServer -TransportType Grpc
+
 # Stop server by name
 Stop-PSHostServer -Name 'PSHostTcpServer8080'
 
@@ -411,6 +467,7 @@ $server.ConnectionCount  # Number of active connections
 $server.Connections      # Array of connection details
 $server.MaxConnections   # Maximum allowed connections (0 = unlimited)
 $server.DrainTimeout     # Graceful shutdown timeout in seconds
+$server.GrpcUri          # gRPC endpoint URI, when TransportType is Grpc
 ```
 
 ## Connect-PSHostProcess - Attach to Running PowerShell
