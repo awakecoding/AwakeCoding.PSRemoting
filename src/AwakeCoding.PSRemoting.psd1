@@ -55,7 +55,10 @@ RequiredAssemblies = @(
     'Tmds.Ssh.dll',
     'BouncyCastle.Cryptography.dll',
     'Microsoft.Extensions.Logging.Abstractions.dll',
-    'Microsoft.Extensions.DependencyInjection.Abstractions.dll'
+    'Microsoft.Extensions.DependencyInjection.Abstractions.dll',
+    'Google.Protobuf.dll',
+    'Grpc.Core.Api.dll',
+    'Grpc.Core.dll'
 )
 
 # Script files (.ps1) that are run in the caller's environment prior to importing this module.

@@ -199,6 +199,12 @@ Describe 'Module Manifest Tests' {
     It 'Requires PowerShell 7.2 or later' {
         $Manifest.PowerShellVersion | Should -BeGreaterOrEqual ([version]'7.2')
     }
+
+    It 'Includes gRPC dependencies in RequiredAssemblies' {
+        $Manifest.RequiredAssemblies | Should -Contain 'Google.Protobuf.dll'
+        $Manifest.RequiredAssemblies | Should -Contain 'Grpc.Core.Api.dll'
+        $Manifest.RequiredAssemblies | Should -Contain 'Grpc.Core.dll'
+    }
 }
 
 Describe 'New-PSHostSession Cmdlet Tests' {
@@ -213,6 +219,11 @@ Describe 'New-PSHostSession Cmdlet Tests' {
             $command.Parameters.ContainsKey('UseImplicitCredential') | Should -BeTrue
             $command.Parameters.ContainsKey('AuthenticationProvider') | Should -BeFalse
             $command.Parameters.ContainsKey('WinRMTransport') | Should -BeFalse
+        }
+
+        It 'Exposes gRPC URI parameter on New-PSHostSession and Enter-PSHostSession' {
+            (Get-Command New-PSHostSession).Parameters.ContainsKey('GrpcUri') | Should -BeTrue
+            (Get-Command Enter-PSHostSession).Parameters.ContainsKey('GrpcUri') | Should -BeTrue
         }
     }
 
@@ -995,6 +1006,72 @@ Describe 'Unified Server Cmdlet Tests' {
             }
         }
 
+        Context 'gRPC Server Tests' {
+            AfterEach {
+                Get-PSHostServer -TransportType Grpc -ErrorAction SilentlyContinue | Stop-PSHostServer -Force -ErrorAction SilentlyContinue
+            }
+
+            It 'Starts a gRPC server successfully' {
+                $server = Start-PSHostServer -TransportType Grpc -Port 0
+                try {
+                    $server | Should -Not -BeNullOrEmpty
+                    $server.State | Should -Be 'Running'
+                    $server.Port | Should -BeGreaterThan 0
+                    $server.ListenAddress | Should -Be '127.0.0.1'
+                    $server.GrpcUri | Should -Match "^grpc://127\.0\.0\.1:$($server.Port)$"
+                    $server.UseSecureConnection | Should -BeFalse
+                }
+                finally {
+                    Stop-PSHostServer -Server $server -Force
+                }
+            }
+
+            It 'Uses custom name when provided' {
+                $server = Start-PSHostServer -TransportType Grpc -Port 0 -Name 'GrpcNameTest'
+                try {
+                    $server.Name | Should -Be 'GrpcNameTest'
+                }
+                finally {
+                    Stop-PSHostServer -Server $server -Force
+                }
+            }
+
+            It 'Gets gRPC servers with TransportType filter' {
+                $server1 = Start-PSHostServer -TransportType Grpc -Port 0
+                $server2 = Start-PSHostServer -TransportType Grpc -Port 0
+                try {
+                    $servers = Get-PSHostServer -TransportType Grpc
+                    $servers | Should -HaveCount 2
+                }
+                finally {
+                    Stop-PSHostServer -Server $server1 -Force
+                    Stop-PSHostServer -Server $server2 -Force
+                }
+            }
+
+            It 'Stops gRPC server by port' {
+                $server = Start-PSHostServer -TransportType Grpc -Port 0
+                $port = $server.Port
+                Stop-PSHostServer -Port $port
+                $retrieved = Get-PSHostServer -Port $port -ErrorAction SilentlyContinue
+                $retrieved | Should -BeNullOrEmpty
+            }
+
+            It 'Throws error when starting gRPC server on duplicate port' {
+                $server1 = Start-PSHostServer -TransportType Grpc -Port 0 -Name 'GrpcServer1'
+                try {
+                    { Start-PSHostServer -TransportType Grpc -Port $server1.Port -Name 'GrpcServer2' -ErrorAction Stop } | Should -Throw -ExpectedMessage '*already*'
+                }
+                finally {
+                    Stop-PSHostServer -Server $server1 -Force
+                }
+            }
+
+            It 'Rejects non-loopback plaintext without explicit opt-in' {
+                { Start-PSHostServer -TransportType Grpc -Port 0 -ListenAddress '0.0.0.0' -ErrorAction Stop } | Should -Throw -ExpectedMessage '*Plaintext gRPC*'
+            }
+        }
+
         It 'Throws error if WinRM port is duplicate' {
             $server = Start-PSHostServer -TransportType WinRM -Port 19857
             try {
@@ -1024,9 +1101,10 @@ Describe 'Unified Server Cmdlet Tests' {
             $tcpServer = Start-PSHostServer -TransportType TCP -Port 0
             $wsServer = Start-PSHostServer -TransportType WebSocket -Port 8100
             $pipeServer = Start-PSHostServer -TransportType NamedPipe
+            $grpcServer = Start-PSHostServer -TransportType Grpc -Port 0
             try {
                 $allServers = Get-PSHostServer
-                $allServers | Should -HaveCount 3
+                $allServers | Should -HaveCount 4
                 
                 $tcpServers = Get-PSHostServer -TransportType TCP
                 $tcpServers | Should -HaveCount 1
@@ -1036,11 +1114,15 @@ Describe 'Unified Server Cmdlet Tests' {
                 
                 $pipeServers = Get-PSHostServer -TransportType NamedPipe
                 $pipeServers | Should -HaveCount 1
+
+                $grpcServers = Get-PSHostServer -TransportType Grpc
+                $grpcServers | Should -HaveCount 1
             }
             finally {
                 Stop-PSHostServer -Server $tcpServer -Force
                 Stop-PSHostServer -Server $wsServer -Force
                 Stop-PSHostServer -Server $pipeServer -Force
+                Stop-PSHostServer -Server $grpcServer -Force
             }
         }
     }
@@ -1205,6 +1287,77 @@ Describe 'End-to-End Client Transport Tests' {
         }
     }
 
+    Context 'gRPC Client Transport' {
+        BeforeAll {
+            $script:GrpcServer = Start-PSHostServer -TransportType Grpc -Port 0 -Name 'GrpcE2ETest'
+            $script:GrpcUri = [uri]$script:GrpcServer.GrpcUri
+        }
+
+        AfterAll {
+            Stop-PSHostServer -Server $script:GrpcServer -Force -ErrorAction SilentlyContinue
+        }
+
+        It 'Connects to gRPC server using URI' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -OpenTimeout 15000
+            try {
+                $session | Should -Not -BeNullOrEmpty
+                $session.State | Should -Be 'Opened'
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Executes commands over gRPC transport' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -OpenTimeout 15000
+            try {
+                $result = Invoke-Command -Session $session -ScriptBlock { 5 + 5 } -ErrorAction Stop
+                $result | Should -Be 10
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Retrieves PSVersionTable over gRPC' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -OpenTimeout 15000
+            try {
+                $version = Invoke-Command -Session $session -ScriptBlock { $PSVersionTable.PSVersion.Major } -ErrorAction Stop
+                $version | Should -BeGreaterOrEqual 7
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Supports multiple sequential gRPC connections' {
+            for ($i = 1; $i -le 3; $i++) {
+                $session = New-PSHostSession -GrpcUri $script:GrpcUri -OpenTimeout 15000
+                try {
+                    $result = Invoke-Command -Session $session -ScriptBlock { param($n) $n * 3 } -ArgumentList $i -ErrorAction Stop
+                    $result | Should -Be ($i * 3)
+                }
+                finally {
+                    Remove-PSHostSessionSafely -Session $session
+                }
+            }
+        }
+
+        It 'Supports two simultaneous gRPC sessions' {
+            $session1 = New-PSHostSession -GrpcUri $script:GrpcUri -OpenTimeout 15000
+            $session2 = New-PSHostSession -GrpcUri $script:GrpcUri -OpenTimeout 15000
+            try {
+                $session1.State | Should -Be 'Opened'
+                $session2.State | Should -Be 'Opened'
+                $session1.InstanceId | Should -Not -Be $session2.InstanceId
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session1
+                Remove-PSHostSessionSafely -Session $session2
+            }
+        }
+    }
+
     Context 'Transport Error Handling' {
         It 'Throws timeout error when TCP server not listening' {
             { New-PSHostSession -HostName 'localhost' -Port 59999 -OpenTimeout 2000 -ErrorAction Stop } | Should -Throw
@@ -1216,6 +1369,14 @@ Describe 'End-to-End Client Transport Tests' {
 
         It 'Throws timeout error when named pipe does not exist' {
             { New-PSHostSession -PipeName 'NonExistentPipe12345' -OpenTimeout 2000 -ErrorAction Stop } | Should -Throw
+        }
+
+        It 'Throws error for invalid gRPC URI scheme' {
+            { New-PSHostSession -GrpcUri 'http://localhost:8080' -ErrorAction Stop } | Should -Throw -ExpectedMessage '*Invalid gRPC URI*'
+        }
+
+        It 'Throws timeout or connection error when gRPC server is not listening' {
+            { New-PSHostSession -GrpcUri 'grpc://localhost:59997' -OpenTimeout 2000 -ErrorAction Stop } | Should -Throw
         }
     }
 

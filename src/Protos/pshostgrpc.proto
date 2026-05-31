@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+option csharp_namespace = "AwakeCoding.PSRemoting.PowerShell.Grpc";
+
+package awakecoding.psremoting;
+
+service PSHostGrpcTransport {
+  rpc Connect(stream PSHostGrpcFrame) returns (stream PSHostGrpcFrame);
+}
+
+message PSHostGrpcFrame {
+  PSHostGrpcFrameKind kind = 1;
+  bytes payload = 2;
+}
+
+enum PSHostGrpcFrameKind {
+  Input = 0;
+  Output = 1;
+  Error = 2;
+  Close = 3;
+}
