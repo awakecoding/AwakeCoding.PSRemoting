@@ -95,6 +95,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         public override void CreateAsync()
         {
+            PSHostGrpcPlatform.EnsureSupported();
+
             ChannelCredentials credentials = _connectionInfo.GrpcUri.Scheme.Equals("grpcs", StringComparison.OrdinalIgnoreCase)
                 ? new SslCredentials()
                 : ChannelCredentials.Insecure;

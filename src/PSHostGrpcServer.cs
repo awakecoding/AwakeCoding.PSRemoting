@@ -50,6 +50,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         public override void StartListenerAsync()
         {
+            PSHostGrpcPlatform.EnsureSupported();
+
             if (State == ServerState.Running || State == ServerState.Starting)
             {
                 throw new InvalidOperationException($"Server '{Name}' is already {State}");

@@ -2,6 +2,11 @@ BeforeDiscovery {
     # Detect Docker availability during discovery for skip logic
     # Test-DockerAvailable checks for Linux container support
     $script:SSHTestingEnabled = $false
+    $script:GrpcTestingEnabled = -not (
+        [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX) -and
+        [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64
+    )
+
     $sshHelperPath = Join-Path $PSScriptRoot 'SSHTestHelper.psm1'
     if (Test-Path $sshHelperPath) {
         Import-Module $sshHelperPath -Force -ErrorAction SilentlyContinue
@@ -1006,7 +1011,7 @@ Describe 'Unified Server Cmdlet Tests' {
             }
         }
 
-        Context 'gRPC Server Tests' {
+        Context 'gRPC Server Tests' -Skip:(-not $script:GrpcTestingEnabled) {
             AfterEach {
                 Get-PSHostServer -TransportType Grpc -ErrorAction SilentlyContinue | Stop-PSHostServer -Force -ErrorAction SilentlyContinue
             }
@@ -1097,14 +1102,20 @@ Describe 'Unified Server Cmdlet Tests' {
 
     Context 'Mixed Transport Tests' {
 
-        It 'Can run all three transport types simultaneously' {
+        It 'Can run all supported transport types simultaneously' {
             $tcpServer = Start-PSHostServer -TransportType TCP -Port 0
             $wsServer = Start-PSHostServer -TransportType WebSocket -Port 8100
             $pipeServer = Start-PSHostServer -TransportType NamedPipe
-            $grpcServer = Start-PSHostServer -TransportType Grpc -Port 0
+            $grpcServer = $null
+
+            if ($script:GrpcTestingEnabled) {
+                $grpcServer = Start-PSHostServer -TransportType Grpc -Port 0
+            }
+
             try {
                 $allServers = Get-PSHostServer
-                $allServers | Should -HaveCount 4
+                $expectedServerCount = if ($script:GrpcTestingEnabled) { 4 } else { 3 }
+                $allServers | Should -HaveCount $expectedServerCount
                 
                 $tcpServers = Get-PSHostServer -TransportType TCP
                 $tcpServers | Should -HaveCount 1
@@ -1115,14 +1126,18 @@ Describe 'Unified Server Cmdlet Tests' {
                 $pipeServers = Get-PSHostServer -TransportType NamedPipe
                 $pipeServers | Should -HaveCount 1
 
-                $grpcServers = Get-PSHostServer -TransportType Grpc
-                $grpcServers | Should -HaveCount 1
+                if ($script:GrpcTestingEnabled) {
+                    $grpcServers = Get-PSHostServer -TransportType Grpc
+                    $grpcServers | Should -HaveCount 1
+                }
             }
             finally {
                 Stop-PSHostServer -Server $tcpServer -Force
                 Stop-PSHostServer -Server $wsServer -Force
                 Stop-PSHostServer -Server $pipeServer -Force
-                Stop-PSHostServer -Server $grpcServer -Force
+                if ($grpcServer) {
+                    Stop-PSHostServer -Server $grpcServer -Force
+                }
             }
         }
     }
@@ -1287,7 +1302,7 @@ Describe 'End-to-End Client Transport Tests' {
         }
     }
 
-    Context 'gRPC Client Transport' {
+    Context 'gRPC Client Transport' -Skip:(-not $script:GrpcTestingEnabled) {
         BeforeAll {
             $script:GrpcServer = Start-PSHostServer -TransportType Grpc -Port 0 -Name 'GrpcE2ETest'
             $script:GrpcUri = [uri]$script:GrpcServer.GrpcUri

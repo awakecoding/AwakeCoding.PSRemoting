@@ -150,10 +150,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             // Check if another server is already listening on this port
-            var serverOnPort = PSHostServerBase.GetServerByPort(portValue);
-            if (serverOnPort != null)
+            if (portValue > 0)
             {
-                throw new InvalidOperationException($"Server '{serverOnPort.Name}' is already listening on port {portValue}");
+                var serverOnPort = PSHostServerBase.GetServerByPort(portValue);
+                if (serverOnPort != null)
+                {
+                    throw new InvalidOperationException($"Server '{serverOnPort.Name}' is already listening on port {portValue}");
+                }
             }
 
             return new PSHostTcpServer(
