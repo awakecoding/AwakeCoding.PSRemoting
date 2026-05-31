@@ -21,12 +21,15 @@ Copy-Item "$PSScriptRoot\src\AwakeCoding.PSRemoting.psd1" $ModulePath -Force
 # Copy the main module DLL
 Copy-Item "$OutputPath\AwakeCoding.PSRemoting.PowerShell.dll" $ModulePath -Force
 
-# Copy required dependency DLLs (Tmds.Ssh and its dependencies)
+# Copy required dependency DLLs (Tmds.Ssh, gRPC, and their managed dependencies)
 $Dependencies = @(
     "Tmds.Ssh.dll",
     "BouncyCastle.Cryptography.dll",
     "Microsoft.Extensions.Logging.Abstractions.dll",
-    "Microsoft.Extensions.DependencyInjection.Abstractions.dll"
+    "Microsoft.Extensions.DependencyInjection.Abstractions.dll",
+    "Google.Protobuf.dll",
+    "Grpc.Core.Api.dll",
+    "Grpc.Core.dll"
 )
 
 foreach ($dll in $Dependencies) {

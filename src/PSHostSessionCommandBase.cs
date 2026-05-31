@@ -24,6 +24,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         protected const string SSHParameterSet = "SSH";
         protected const string WinRMComputerNameParameterSet = "WinRMComputerName";
         protected const string WinRMConnectionUriParameterSet = "WinRMConnectionUri";
+        protected const string GrpcParameterSet = "Grpc";
 
         protected const int DefaultOpenTimeoutMs = 30000;
         protected const int DefaultReadinessTimeoutMs = 5000;
@@ -223,6 +224,17 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         #endregion
 
+        #region gRPC Parameters
+
+        /// <summary>
+        /// gRPC endpoint URI (e.g., grpc://localhost:8080 or grpcs://localhost:8443)
+        /// </summary>
+        [Parameter(ParameterSetName = GrpcParameterSet, Mandatory = true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        public Uri? GrpcUri { get; set; }
+
+        #endregion
+
         #region NamedPipe Parameters
 
         [Parameter(ParameterSetName = NamedPipeParameterSet, Mandatory = true)]
@@ -294,6 +306,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 case WinRMConnectionUriParameterSet:
                     _connectionInfo = CreateWinRMConnectionInfo();
                     TransportName ??= "WinRM";
+                    break;
+
+                case GrpcParameterSet:
+                    _connectionInfo = CreateGrpcConnectionInfo();
+                    TransportName ??= "PSHostGrpc";
                     break;
 
                 case SubprocessParameterSet:
@@ -446,6 +463,30 @@ namespace AwakeCoding.PSRemoting.PowerShell
             };
 
             return connectionInfo;
+        }
+
+        private RunspaceConnectionInfo CreateGrpcConnectionInfo()
+        {
+            if (GrpcUri == null)
+            {
+                throw new ArgumentException("GrpcUri is required for gRPC connections");
+            }
+
+            if (!GrpcUri.Scheme.Equals("grpc", StringComparison.OrdinalIgnoreCase) &&
+                !GrpcUri.Scheme.Equals("grpcs", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException($"Invalid gRPC URI scheme: {GrpcUri.Scheme}. Expected 'grpc' or 'grpcs'.");
+            }
+
+            if (GrpcUri.Port <= 0)
+            {
+                throw new ArgumentException("GrpcUri must include a port.");
+            }
+
+            return new PSHostGrpcClientInfo(GrpcUri)
+            {
+                OpenTimeout = OpenTimeout
+            };
         }
 
         private RunspaceConnectionInfo CreateSSHConnectionInfo()

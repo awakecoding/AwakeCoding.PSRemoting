@@ -23,6 +23,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// <summary>
         /// WinRM (WSMan over HTTP/HTTPS) transport
         /// </summary>
-        WinRM
+        WinRM,
+
+        /// <summary>
+        /// gRPC transport
+        /// </summary>
+        Grpc
     }
 }

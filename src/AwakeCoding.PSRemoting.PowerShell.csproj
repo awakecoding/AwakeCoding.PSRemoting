@@ -16,12 +16,19 @@
 
   <ItemGroup>
     <PackageReference Include="Devolutions.Sspi" Version="2026.3.27" ExcludeAssets="build;buildTransitive" />
+    <PackageReference Include="Google.Protobuf" Version="3.32.1" />
+    <PackageReference Include="Grpc.Core" Version="2.46.6" />
+    <PackageReference Include="Grpc.Tools" Version="2.72.0" PrivateAssets="all" />
     <PackageReference Include="System.Management.Automation" Version="7.4.*" PrivateAssets="all" />
     <PackageReference Include="System.Net.Http.WinHttpHandler" Version="*" />
     <PackageReference Include="Tmds.Ssh" Version="0.11.0" />
     <Reference Include="System.Management.Automation">
       <HintPath>.\Ref\System.Management.Automation.dll</HintPath>
     </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Protobuf Include="Protos\pshostgrpc.proto" GrpcServices="Both" />
   </ItemGroup>
 
 </Project>

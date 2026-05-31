@@ -8,7 +8,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
     /// Start-PSHostServer cmdlet - Starts a PowerShell remoting server with specified transport
     /// </summary>
     [Cmdlet(VerbsLifecycle.Start, "PSHostServer")]
-    [OutputType(typeof(PSHostTcpServer), typeof(PSHostWebSocketServer), typeof(PSHostNamedPipeServer), typeof(PSHostWinRMServer))]
+    [OutputType(typeof(PSHostTcpServer), typeof(PSHostWebSocketServer), typeof(PSHostNamedPipeServer), typeof(PSHostWinRMServer), typeof(PSHostGrpcServer))]
     public sealed class StartPSHostServerCommand : PSCmdlet
     {
         // Common parameters
@@ -28,7 +28,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         [ValidateRange(0, int.MaxValue)]
         public int DrainTimeout { get; set; } = 30;
 
-        // TCP and WebSocket parameters
+        // TCP, WebSocket, and gRPC parameters
         [Parameter(Position = 1)]
         [ValidateRange(0, 65535)]
         public int? Port { get; set; }
@@ -44,6 +44,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         [Parameter()]
         public SwitchParameter UseSecureConnection { get; set; }
+
+        // gRPC-specific parameters
+        [Parameter()]
+        public SwitchParameter AllowUnencrypted { get; set; }
 
         // NamedPipe-specific parameters
         [Parameter(Position = 1)]
@@ -81,6 +85,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                     case PSHostTransportType.WinRM:
                         server = CreateWinRMServer();
+                        break;
+
+                    case PSHostTransportType.Grpc:
+                        server = CreateGrpcServer();
                         break;
 
                     default:
@@ -142,10 +150,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             // Check if another server is already listening on this port
-            var serverOnPort = PSHostServerBase.GetServerByPort(portValue);
-            if (serverOnPort != null)
+            if (portValue > 0)
             {
-                throw new InvalidOperationException($"Server '{serverOnPort.Name}' is already listening on port {portValue}");
+                var serverOnPort = PSHostServerBase.GetServerByPort(portValue);
+                if (serverOnPort != null)
+                {
+                    throw new InvalidOperationException($"Server '{serverOnPort.Name}' is already listening on port {portValue}");
+                }
             }
 
             return new PSHostTcpServer(
@@ -274,6 +285,39 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 drainTimeout: DrainTimeout,
                 requiredCredential: Credential);
         }
+
+        private PSHostGrpcServer CreateGrpcServer()
+        {
+            if (!Port.HasValue)
+                throw new ArgumentException("Port parameter is required for gRPC transport");
+
+            int portValue = Port.Value;
+
+            if (string.IsNullOrWhiteSpace(Name))
+            {
+                Name = portValue == 0 ? $"PSHostGrpcServer{Guid.NewGuid().ToString("N").Substring(0, 8)}" : $"PSHostGrpcServer{portValue}";
+            }
+
+            var existingServer = PSHostServerBase.GetServer(Name);
+            if (existingServer != null)
+                throw new InvalidOperationException($"Server with name '{Name}' already exists");
+
+            if (portValue > 0)
+            {
+                var serverOnPort = PSHostServerBase.GetServerByPort(portValue);
+                if (serverOnPort != null)
+                    throw new InvalidOperationException($"Server '{serverOnPort.Name}' is already listening on port {portValue}");
+            }
+
+            return new PSHostGrpcServer(
+                name: Name,
+                port: portValue,
+                listenAddress: ListenAddress,
+                useSecureConnection: UseSecureConnection,
+                allowUnencrypted: AllowUnencrypted,
+                maxConnections: MaxConnections,
+                drainTimeout: DrainTimeout);
+        }
     }
 
     /// <summary>
@@ -374,7 +418,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
     /// Get-PSHostServer cmdlet - Retrieves PowerShell remoting servers
     /// </summary>
     [Cmdlet(VerbsCommon.Get, "PSHostServer", DefaultParameterSetName = "All")]
-    [OutputType(typeof(PSHostTcpServer), typeof(PSHostWebSocketServer), typeof(PSHostNamedPipeServer), typeof(PSHostWinRMServer))]
+    [OutputType(typeof(PSHostTcpServer), typeof(PSHostWebSocketServer), typeof(PSHostNamedPipeServer), typeof(PSHostWinRMServer), typeof(PSHostGrpcServer))]
     public sealed class GetPSHostServerCommand : PSCmdlet
     {
         [Parameter(ParameterSetName = "ByName", Position = 0, Mandatory = true, ValueFromPipeline = true, ValueFromPipelineByPropertyName = true)]
@@ -453,6 +497,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                                 PSHostTransportType.WebSocket => allServers.OfType<PSHostWebSocketServer>(),
                                 PSHostTransportType.NamedPipe => allServers.OfType<PSHostNamedPipeServer>(),
                                 PSHostTransportType.WinRM => allServers.OfType<PSHostWinRMServer>(),
+                                PSHostTransportType.Grpc => allServers.OfType<PSHostGrpcServer>(),
                                 _ => allServers
                             };
                         }
