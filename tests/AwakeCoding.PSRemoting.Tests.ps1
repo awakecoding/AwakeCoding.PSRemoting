@@ -1371,6 +1371,82 @@ Describe 'End-to-End Client Transport Tests' {
                 Remove-PSHostSessionSafely -Session $session2
             }
         }
+
+        It 'Round-trips complex objects and streams over Protobuf-encoded gRPC transport' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -OpenTimeout 15000
+            try {
+                $guid = [guid]::NewGuid()
+                $result = Invoke-Command -Session $session -ScriptBlock {
+                    param($g)
+                    [pscustomobject]@{
+                        Id      = $g
+                        Version = [version]'2.3.4'
+                        Items   = @(10, 'hello', $true)
+                        Table   = @{ Key = 'Value'; Count = 42 }
+                    }
+                } -ArgumentList $guid -ErrorAction Stop
+
+                $result.Id | Should -Be $guid
+                $result.Version.ToString() | Should -Be '2.3.4'
+                $result.Items | Should -HaveCount 3
+                $result.Items[0] | Should -Be 10
+                $result.Items[1] | Should -Be 'hello'
+                $result.Items[2] | Should -BeTrue
+                $result.Table['Key'] | Should -Be 'Value'
+                $result.Table['Count'] | Should -Be 42
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Encodes PSRP Data packets into binary Protobuf payloads without CLIXML' {
+            $asm = [AwakeCoding.PSRemoting.PowerShell.PSHostGrpcServer].Assembly
+            $codecType = $asm.GetType('AwakeCoding.PSRemoting.PowerShell.PSHostGrpcPsrpCodec')
+            $codec = [Activator]::CreateInstance($codecType)
+            $fragmentBytes = [System.Collections.Generic.List[byte]]::new()
+            # ObjectId = 1 (8 bytes BE), FragmentId = 0 (8 bytes BE), Flags = 3 (Start|End)
+            $fragmentBytes.AddRange([byte[]]@(0, 0, 0, 0, 0, 0, 0, 1))
+            $fragmentBytes.AddRange([byte[]]@(0, 0, 0, 0, 0, 0, 0, 0))
+            $fragmentBytes.Add([byte]3)
+            # RDO: Destination = 2 (Server), DataType = 0x00041002 (RunspacePoolStateInfo), RunspacePoolId, PowerShellId
+            $rdoStream = [System.IO.MemoryStream]::new()
+            $bw = [System.IO.BinaryWriter]::new($rdoStream)
+            $bw.Write([uint32]2)
+            $bw.Write([uint32]0x00041002)
+            $rpId = [guid]::NewGuid()
+            $psId = [guid]::Empty
+            $bw.Write($rpId.ToByteArray())
+            $bw.Write($psId.ToByteArray())
+            $utf8Clixml = [System.Text.Encoding]::UTF8.GetBytes("<Obj RefId=`"0`"><MS><S N=`"Message`">ProtoTest</S><I32 N=`"Value`">123</I32></MS></Obj>")
+            $bw.Write([byte[]]@(0xEF, 0xBB, 0xBF))
+            $bw.Write($utf8Clixml)
+            $bw.Flush()
+            $rdoBytes = $rdoStream.ToArray()
+            $lenBytes = [System.BitConverter]::GetBytes([uint32]$rdoBytes.Length)
+            if ([System.BitConverter]::IsLittleEndian) { [System.Array]::Reverse($lenBytes) }
+            $fragmentBytes.AddRange($lenBytes)
+            $fragmentBytes.AddRange($rdoBytes)
+
+            $b64 = [Convert]::ToBase64String($fragmentBytes.ToArray())
+            $packetLine = "<Data Stream='Default' PSGuid='$psId'>$b64</Data>"
+
+            $encodeMethod = $codecType.GetMethod('EncodePacketLineToFrames', [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+            $decodeMethod = $codecType.GetMethod('DecodeFrameToPacketLine', [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+
+            $frames = @($encodeMethod.Invoke($codec, @($packetLine)))
+            $frames | Should -HaveCount 1
+            $frame = $frames[0]
+            $frame.Kind.ToString() | Should -Be 'Data'
+            $frame.Payload.Length | Should -BeGreaterThan 0
+
+            $payloadText = [System.Text.Encoding]::UTF8.GetString($frame.Payload.ToByteArray())
+            $payloadText | Should -Not -Match '<Obj'
+            $payloadText | Should -Match 'ProtoTest'
+
+            $decodedLine = $decodeMethod.Invoke($codec, @($frame))
+            $decodedLine | Should -Match "^<Data Stream='Default' PSGuid='$psId'>"
+        }
     }
 
     Context 'Transport Error Handling' {

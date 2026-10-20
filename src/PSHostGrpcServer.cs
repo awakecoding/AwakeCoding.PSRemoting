@@ -302,8 +302,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     _owner.AddConnection(new ConnectionDetails(connectionId, clientAddress, process.Id));
 
                     Task inputTask = ProxyGrpcToProcessAsync(requestStream, process.StandardInput.BaseStream, linkedCts.Token);
-                    Task outputTask = ProxyProcessToGrpcAsync(process.StandardOutput.BaseStream, responseStream, PSHostGrpcFrameKind.Output, writeLock, linkedCts.Token);
-                    Task errorTask = ProxyProcessToGrpcAsync(process.StandardError.BaseStream, responseStream, PSHostGrpcFrameKind.Error, writeLock, linkedCts.Token);
+                    Task outputTask = ProxyProcessOutputToGrpcAsync(process.StandardOutput.BaseStream, responseStream, writeLock, linkedCts.Token);
+                    Task errorTask = ProxyProcessErrorToGrpcAsync(process.StandardError.BaseStream, responseStream, writeLock, linkedCts.Token);
 
                     await Task.WhenAny(inputTask, outputTask, errorTask).ConfigureAwait(false);
                     linkedCts.Cancel();
@@ -340,6 +340,12 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 Stream destination,
                 CancellationToken cancellationToken)
             {
+                var inboundCodec = new PSHostGrpcPsrpCodec();
+                using var writer = new StreamWriter(destination, new System.Text.UTF8Encoding(encoderShouldEmitUTF8Identifier: false), BufferSize, leaveOpen: true)
+                {
+                    NewLine = "\n"
+                };
+
                 while (await requestStream.MoveNext(cancellationToken).ConfigureAwait(false))
                 {
                     var frame = requestStream.Current;
@@ -348,21 +354,55 @@ namespace AwakeCoding.PSRemoting.PowerShell
                         break;
                     }
 
-                    if (frame.Kind != PSHostGrpcFrameKind.Input || frame.Payload.Length == 0)
+                    string? packetLine = inboundCodec.DecodeFrameToPacketLine(frame);
+                    if (!string.IsNullOrEmpty(packetLine))
+                    {
+                        await writer.WriteLineAsync(packetLine.AsMemory(), cancellationToken).ConfigureAwait(false);
+                        await writer.FlushAsync().ConfigureAwait(false);
+                    }
+                }
+            }
+
+            private static async Task ProxyProcessOutputToGrpcAsync(
+                Stream source,
+                IServerStreamWriter<PSHostGrpcFrame> responseStream,
+                SemaphoreSlim writeLock,
+                CancellationToken cancellationToken)
+            {
+                var outboundCodec = new PSHostGrpcPsrpCodec();
+                using var reader = new StreamReader(source, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: false, BufferSize, leaveOpen: true);
+
+                while (true)
+                {
+                    string? line = await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+                    if (line == null)
+                    {
+                        break;
+                    }
+
+                    if (string.IsNullOrWhiteSpace(line))
                     {
                         continue;
                     }
 
-                    byte[] buffer = frame.Payload.ToByteArray();
-                    await destination.WriteAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
-                    await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    foreach (var frame in outboundCodec.EncodePacketLineToFrames(line))
+                    {
+                        await writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                        try
+                        {
+                            await responseStream.WriteAsync(frame).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            writeLock.Release();
+                        }
+                    }
                 }
             }
 
-            private static async Task ProxyProcessToGrpcAsync(
+            private static async Task ProxyProcessErrorToGrpcAsync(
                 Stream source,
                 IServerStreamWriter<PSHostGrpcFrame> responseStream,
-                PSHostGrpcFrameKind kind,
                 SemaphoreSlim writeLock,
                 CancellationToken cancellationToken)
             {
@@ -378,7 +418,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                     var frame = new PSHostGrpcFrame
                     {
-                        Kind = kind,
+                        Kind = PSHostGrpcFrameKind.Error,
                         Payload = ByteString.CopyFrom(buffer, 0, bytesRead)
                     };
 

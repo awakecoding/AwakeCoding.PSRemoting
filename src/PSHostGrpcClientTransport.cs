@@ -77,6 +77,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         private readonly PSHostGrpcClientInfo _connectionInfo;
         private readonly object _sendLock = new object();
+        private readonly PSHostGrpcPsrpCodec _outboundCodec = new PSHostGrpcPsrpCodec();
+        private readonly PSHostGrpcPsrpCodec _inboundCodec = new PSHostGrpcPsrpCodec();
 
         private Channel? _channel;
         private AsyncDuplexStreamingCall<PSHostGrpcFrame, PSHostGrpcFrame>? _call;
@@ -144,11 +146,20 @@ namespace AwakeCoding.PSRemoting.PowerShell
             {
                 try
                 {
-                    call.RequestStream.WriteAsync(new PSHostGrpcFrame
+                    using var reader = new StringReader(data);
+                    string? line;
+                    while ((line = reader.ReadLine()) != null)
                     {
-                        Kind = PSHostGrpcFrameKind.Input,
-                        Payload = ByteString.CopyFrom(data, Encoding.UTF8)
-                    }).GetAwaiter().GetResult();
+                        if (string.IsNullOrWhiteSpace(line))
+                        {
+                            continue;
+                        }
+
+                        foreach (var frame in _outboundCodec.EncodePacketLineToFrames(line))
+                        {
+                            call.RequestStream.WriteAsync(frame).GetAwaiter().GetResult();
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -207,8 +218,19 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     var frame = _call.ResponseStream.Current;
                     switch (frame.Kind)
                     {
-                        case PSHostGrpcFrameKind.Output:
-                            ProcessPayload(frame.Payload, outputBuffer, HandleOutputDataReceived);
+                        case PSHostGrpcFrameKind.Data:
+                        case PSHostGrpcFrameKind.DataAck:
+                        case PSHostGrpcFrameKind.Command:
+                        case PSHostGrpcFrameKind.CommandAck:
+                        case PSHostGrpcFrameKind.ClosePacket:
+                        case PSHostGrpcFrameKind.CloseAck:
+                        case PSHostGrpcFrameKind.Signal:
+                        case PSHostGrpcFrameKind.SignalAck:
+                            string? packetLine = _inboundCodec.DecodeFrameToPacketLine(frame);
+                            if (!string.IsNullOrEmpty(packetLine))
+                            {
+                                HandleOutputDataReceived(packetLine);
+                            }
                             break;
 
                         case PSHostGrpcFrameKind.Error:

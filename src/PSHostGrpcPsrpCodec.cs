@@ -1,0 +1,563 @@
+using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Management.Automation;
+using System.Management.Automation.Internal;
+using System.Management.Automation.Remoting;
+using System.Reflection;
+using System.Text;
+using System.Xml;
+using AwakeCoding.PSRemoting.PowerShell.Grpc;
+using Google.Protobuf;
+
+namespace AwakeCoding.PSRemoting.PowerShell
+{
+    /// <summary>
+    /// Converts PSRP stdio XML packets and CLIXML-encoded fragments to and from
+    /// gRPC frames carrying Protobuf-encoded PSObject payloads (<see cref="PSProtoSerializer"/>).
+    /// </summary>
+    internal sealed class PSHostGrpcPsrpCodec
+    {
+        private const int FragmentHeaderLength = 21;
+        private const int RemoteDataObjectHeaderLength = 40;
+        private const byte FragmentFlagStart = 0x01;
+        private const byte FragmentFlagEnd = 0x02;
+        private const byte FragmentFlagStartAndEnd = FragmentFlagStart | FragmentFlagEnd;
+        private const int DefaultMaxFragmentBlobSize = 32768 - FragmentHeaderLength;
+
+        private static readonly Encoding s_utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
+        private static readonly Type? s_smaSerializerType = typeof(PSObject).Assembly.GetType("System.Management.Automation.Serializer");
+        private static readonly Type? s_smaDeserializerType = typeof(PSObject).Assembly.GetType("System.Management.Automation.Deserializer");
+        private static readonly Type? s_smaSerializationContextType = typeof(PSObject).Assembly.GetType("System.Management.Automation.SerializationContext");
+        private static readonly Type? s_smaDeserializationContextType = typeof(PSObject).Assembly.GetType("System.Management.Automation.DeserializationContext");
+        private static readonly Type? s_smaSerializationOptionsType = typeof(PSObject).Assembly.GetType("System.Management.Automation.SerializationOptions");
+        private static readonly Type? s_smaDeserializationOptionsType = typeof(PSObject).Assembly.GetType("System.Management.Automation.DeserializationOptions");
+
+        private static readonly object? s_smaRemotingSerOptions = s_smaSerializationOptionsType != null
+            ? Enum.Parse(s_smaSerializationOptionsType, "RemotingOptions")
+            : null;
+        private static readonly object? s_smaRemotingDesOptions = s_smaDeserializationOptionsType != null
+            ? Enum.Parse(s_smaDeserializationOptionsType, "RemotingOptions")
+            : null;
+
+        private static readonly ConstructorInfo? s_smaSerCtxCtor = s_smaSerializationContextType?.GetConstructor(
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            new Type[] { typeof(int), s_smaSerializationOptionsType!, typeof(PSRemotingCryptoHelper) },
+            modifiers: null);
+
+        private static readonly ConstructorInfo? s_smaDesCtxCtor = s_smaDeserializationContextType?.GetConstructor(
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            new Type[] { s_smaDeserializationOptionsType!, typeof(PSRemotingCryptoHelper) },
+            modifiers: null);
+
+        private static readonly ConstructorInfo? s_smaSerializerCtor = s_smaSerializerType != null && s_smaSerializationContextType != null
+            ? s_smaSerializerType.GetConstructor(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                new Type[] { typeof(XmlWriter), s_smaSerializationContextType },
+                modifiers: null)
+            : null;
+
+        private static readonly ConstructorInfo? s_smaDeserializerCtor = s_smaDeserializerType != null && s_smaDeserializationContextType != null
+            ? s_smaDeserializerType.GetConstructor(
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                binder: null,
+                new Type[] { typeof(XmlReader), s_smaDeserializationContextType },
+                modifiers: null)
+            : null;
+
+        private static readonly MethodInfo? s_smaSerializeMethod = s_smaSerializerType?.GetMethod(
+            "Serialize",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            new Type[] { typeof(object) },
+            modifiers: null);
+
+        private static readonly MethodInfo? s_smaSerializerDoneMethod = s_smaSerializerType?.GetMethod(
+            "Done",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            Type.EmptyTypes,
+            modifiers: null);
+
+        private static readonly MethodInfo? s_smaDeserializeMethod = s_smaDeserializerType?.GetMethod(
+            "Deserialize",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            Type.EmptyTypes,
+            modifiers: null);
+
+        private static readonly MethodInfo? s_smaDeserializerDoneMethod = s_smaDeserializerType?.GetMethod(
+            "Done",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+            binder: null,
+            Type.EmptyTypes,
+            modifiers: null);
+
+        private readonly Dictionary<ulong, MemoryStream> _outboundInFlightObjects = new Dictionary<ulong, MemoryStream>();
+        private readonly Dictionary<ulong, ReassemblyBuffer> _inboundInFlightObjects = new Dictionary<ulong, ReassemblyBuffer>();
+
+        private sealed class ReassemblyBuffer
+        {
+            public uint Destination;
+            public uint DataType;
+            public byte[] RunspacePoolId = Array.Empty<byte>();
+            public byte[] PowerShellId = Array.Empty<byte>();
+            public readonly MemoryStream PayloadStream = new MemoryStream();
+        }
+
+        /// <summary>
+        /// Encodes a single OutOfProcess PSRP XML packet line into one or more Protobuf-backed <see cref="PSHostGrpcFrame"/> messages.
+        /// </summary>
+        public IEnumerable<PSHostGrpcFrame> EncodePacketLineToFrames(string line)
+        {
+            string trimmed = line.Trim();
+            if (trimmed.Length == 0)
+            {
+                yield break;
+            }
+
+            using var stringReader = new StringReader(trimmed);
+            var readerSettings = new XmlReaderSettings
+            {
+                CheckCharacters = false,
+                IgnoreComments = true,
+                IgnoreProcessingInstructions = true,
+                IgnoreWhitespace = false,
+                XmlResolver = null,
+                ConformanceLevel = ConformanceLevel.Fragment
+            };
+
+            using var xmlReader = XmlReader.Create(stringReader, readerSettings);
+            if (!xmlReader.Read() || xmlReader.NodeType != XmlNodeType.Element)
+            {
+                throw new PSRemotingTransportException($"Invalid PSRP packet line: {trimmed}");
+            }
+
+            string elementName = xmlReader.Name;
+            string psGuid = xmlReader.GetAttribute("PSGuid") ?? string.Empty;
+            string streamAttr = xmlReader.GetAttribute("Stream") ?? "Default";
+
+            switch (elementName)
+            {
+                case "DataAck":
+                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.DataAck, PsGuid = psGuid };
+                    yield break;
+
+                case "Command":
+                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.Command, PsGuid = psGuid };
+                    yield break;
+
+                case "CommandAck":
+                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.CommandAck, PsGuid = psGuid };
+                    yield break;
+
+                case "Close":
+                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.ClosePacket, PsGuid = psGuid };
+                    yield break;
+
+                case "CloseAck":
+                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.CloseAck, PsGuid = psGuid };
+                    yield break;
+
+                case "Signal":
+                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.Signal, PsGuid = psGuid };
+                    yield break;
+
+                case "SignalAck":
+                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.SignalAck, PsGuid = psGuid };
+                    yield break;
+
+                case "Data":
+                    string base64Content = xmlReader.ReadElementContentAsString();
+                    byte[] rawBytes = Convert.FromBase64String(base64Content);
+                    foreach (var frame in EncodeDataBytesToFrames(rawBytes, psGuid, streamAttr))
+                    {
+                        yield return frame;
+                    }
+                    yield break;
+
+                default:
+                    throw new PSRemotingTransportException($"Unsupported PSRP packet element '{elementName}'.");
+            }
+        }
+
+        private IEnumerable<PSHostGrpcFrame> EncodeDataBytesToFrames(byte[] rawBytes, string psGuid, string streamAttr)
+        {
+            int offset = 0;
+            while (offset + FragmentHeaderLength <= rawBytes.Length)
+            {
+                ulong objectId = BinaryPrimitives.ReadUInt64BigEndian(rawBytes.AsSpan(offset, 8));
+                ulong fragmentId = BinaryPrimitives.ReadUInt64BigEndian(rawBytes.AsSpan(offset + 8, 8));
+                byte flags = rawBytes[offset + 16];
+                int blobLength = BinaryPrimitives.ReadInt32BigEndian(rawBytes.AsSpan(offset + 17, 4));
+                offset += FragmentHeaderLength;
+
+                if (blobLength < 0 || offset + blobLength > rawBytes.Length)
+                {
+                    throw new PSRemotingTransportException("Invalid PSRP fragment length.");
+                }
+
+                bool isStart = (flags & FragmentFlagStart) != 0;
+                bool isEnd = (flags & FragmentFlagEnd) != 0;
+
+                MemoryStream? objectStream;
+                if (isStart && isEnd)
+                {
+                    objectStream = new MemoryStream(rawBytes, offset, blobLength, writable: false);
+                }
+                else if (isStart)
+                {
+                    objectStream = new MemoryStream();
+                    objectStream.Write(rawBytes, offset, blobLength);
+                    _outboundInFlightObjects[objectId] = objectStream;
+                    offset += blobLength;
+                    continue;
+                }
+                else
+                {
+                    if (!_outboundInFlightObjects.TryGetValue(objectId, out objectStream))
+                    {
+                        throw new PSRemotingTransportException($"Missing start fragment for PSRP ObjectId {objectId}.");
+                    }
+
+                    objectStream.Write(rawBytes, offset, blobLength);
+                    if (!isEnd)
+                    {
+                        offset += blobLength;
+                        continue;
+                    }
+
+                    _outboundInFlightObjects.Remove(objectId);
+                    objectStream.Position = 0;
+                }
+
+                offset += blobLength;
+
+                byte[] fullObjectBytes = objectStream.ToArray();
+                objectStream.Dispose();
+
+                if (fullObjectBytes.Length < RemoteDataObjectHeaderLength)
+                {
+                    throw new PSRemotingTransportException("Reassembled PSRP RemoteDataObject is shorter than 40-byte header.");
+                }
+
+                uint destination = BinaryPrimitives.ReadUInt32LittleEndian(fullObjectBytes.AsSpan(0, 4));
+                uint dataType = BinaryPrimitives.ReadUInt32LittleEndian(fullObjectBytes.AsSpan(4, 4));
+                byte[] runspacePoolId = fullObjectBytes.AsSpan(8, 16).ToArray();
+                byte[] powerShellId = fullObjectBytes.AsSpan(24, 16).ToArray();
+
+                byte[] protoPayloadBytes;
+                int clixmlLength = fullObjectBytes.Length - RemoteDataObjectHeaderLength;
+                if (clixmlLength > 0)
+                {
+                    object? psObj = DeserializeClixmlRemotingPayload(fullObjectBytes, RemoteDataObjectHeaderLength, clixmlLength);
+                    protoPayloadBytes = SerializeProtoRemotingPayload(psObj);
+                }
+                else
+                {
+                    protoPayloadBytes = Array.Empty<byte>();
+                }
+
+                if (protoPayloadBytes.Length <= DefaultMaxFragmentBlobSize)
+                {
+                    yield return new PSHostGrpcFrame
+                    {
+                        Kind = PSHostGrpcFrameKind.Data,
+                        PsGuid = psGuid,
+                        Stream = streamAttr,
+                        ObjectId = objectId,
+                        FragmentId = 0,
+                        BlobFlags = FragmentFlagStartAndEnd,
+                        Destination = destination,
+                        DataType = dataType,
+                        RunspacePoolId = ByteString.CopyFrom(runspacePoolId),
+                        PowershellId = ByteString.CopyFrom(powerShellId),
+                        Payload = ByteString.CopyFrom(protoPayloadBytes)
+                    };
+                }
+                else
+                {
+                    int protoOffset = 0;
+                    ulong outFragId = 0;
+                    while (protoOffset < protoPayloadBytes.Length)
+                    {
+                        int chunkLen = Math.Min(DefaultMaxFragmentBlobSize, protoPayloadBytes.Length - protoOffset);
+                        byte outFlags = 0;
+                        if (protoOffset == 0)
+                        {
+                            outFlags |= FragmentFlagStart;
+                        }
+                        if (protoOffset + chunkLen >= protoPayloadBytes.Length)
+                        {
+                            outFlags |= FragmentFlagEnd;
+                        }
+
+                        yield return new PSHostGrpcFrame
+                        {
+                            Kind = PSHostGrpcFrameKind.Data,
+                            PsGuid = psGuid,
+                            Stream = streamAttr,
+                            ObjectId = objectId,
+                            FragmentId = outFragId++,
+                            BlobFlags = outFlags,
+                            Destination = destination,
+                            DataType = dataType,
+                            RunspacePoolId = ByteString.CopyFrom(runspacePoolId),
+                            PowershellId = ByteString.CopyFrom(powerShellId),
+                            Payload = ByteString.CopyFrom(protoPayloadBytes, protoOffset, chunkLen)
+                        };
+
+                        protoOffset += chunkLen;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Decodes a <see cref="PSHostGrpcFrame"/> into an OutOfProcess PSRP XML packet line,
+        /// or returns <c>null</c> if the frame is a non-final fragment of a multi-fragment PSRP object.
+        /// </summary>
+        public string? DecodeFrameToPacketLine(PSHostGrpcFrame frame)
+        {
+            switch (frame.Kind)
+            {
+                case PSHostGrpcFrameKind.DataAck:
+                    return $"<DataAck PSGuid='{frame.PsGuid}' />";
+
+                case PSHostGrpcFrameKind.Command:
+                    return $"<Command PSGuid='{frame.PsGuid}' />";
+
+                case PSHostGrpcFrameKind.CommandAck:
+                    return $"<CommandAck PSGuid='{frame.PsGuid}' />";
+
+                case PSHostGrpcFrameKind.ClosePacket:
+                    return $"<Close PSGuid='{frame.PsGuid}' />";
+
+                case PSHostGrpcFrameKind.CloseAck:
+                    return $"<CloseAck PSGuid='{frame.PsGuid}' />";
+
+                case PSHostGrpcFrameKind.Signal:
+                    return $"<Signal PSGuid='{frame.PsGuid}' />";
+
+                case PSHostGrpcFrameKind.SignalAck:
+                    return $"<SignalAck PSGuid='{frame.PsGuid}' />";
+
+                case PSHostGrpcFrameKind.Data:
+                    return DecodeDataFrameToPacketLine(frame);
+
+                default:
+                    return null;
+            }
+        }
+
+        private string? DecodeDataFrameToPacketLine(PSHostGrpcFrame frame)
+        {
+            ulong objectId = frame.ObjectId;
+            byte flags = (byte)frame.BlobFlags;
+            bool isStart = (flags & FragmentFlagStart) != 0;
+            bool isEnd = (flags & FragmentFlagEnd) != 0;
+
+            uint destination;
+            uint dataType;
+            byte[] runspacePoolId;
+            byte[] powerShellId;
+            byte[] protoPayloadBytes;
+
+            if (isStart && isEnd)
+            {
+                destination = frame.Destination;
+                dataType = frame.DataType;
+                runspacePoolId = frame.RunspacePoolId.ToByteArray();
+                powerShellId = frame.PowershellId.ToByteArray();
+                protoPayloadBytes = frame.Payload.ToByteArray();
+            }
+            else if (isStart)
+            {
+                var buffer = new ReassemblyBuffer
+                {
+                    Destination = frame.Destination,
+                    DataType = frame.DataType,
+                    RunspacePoolId = frame.RunspacePoolId.ToByteArray(),
+                    PowerShellId = frame.PowershellId.ToByteArray()
+                };
+                frame.Payload.WriteTo(buffer.PayloadStream);
+                _inboundInFlightObjects[objectId] = buffer;
+                return null;
+            }
+            else
+            {
+                if (!_inboundInFlightObjects.TryGetValue(objectId, out var buffer))
+                {
+                    throw new PSRemotingTransportException($"Missing start fragment for inbound gRPC PSRP ObjectId {objectId}.");
+                }
+
+                frame.Payload.WriteTo(buffer.PayloadStream);
+                if (!isEnd)
+                {
+                    return null;
+                }
+
+                _inboundInFlightObjects.Remove(objectId);
+                destination = buffer.Destination;
+                dataType = buffer.DataType;
+                runspacePoolId = buffer.RunspacePoolId;
+                powerShellId = buffer.PowerShellId;
+                protoPayloadBytes = buffer.PayloadStream.ToArray();
+                buffer.PayloadStream.Dispose();
+            }
+
+            byte[] clixmlPayloadBytes;
+            if (protoPayloadBytes.Length > 0)
+            {
+                object? psObj = DeserializeProtoRemotingPayload(protoPayloadBytes);
+                clixmlPayloadBytes = SerializeClixmlRemotingPayload(psObj);
+            }
+            else
+            {
+                clixmlPayloadBytes = Array.Empty<byte>();
+            }
+
+            int totalRdoLength = RemoteDataObjectHeaderLength + clixmlPayloadBytes.Length;
+            byte[] rdoBytes = new byte[totalRdoLength];
+            BinaryPrimitives.WriteUInt32LittleEndian(rdoBytes.AsSpan(0, 4), destination);
+            BinaryPrimitives.WriteUInt32LittleEndian(rdoBytes.AsSpan(4, 4), dataType);
+            if (runspacePoolId.Length == 16)
+            {
+                Buffer.BlockCopy(runspacePoolId, 0, rdoBytes, 8, 16);
+            }
+            if (powerShellId.Length == 16)
+            {
+                Buffer.BlockCopy(powerShellId, 0, rdoBytes, 24, 16);
+            }
+            if (clixmlPayloadBytes.Length > 0)
+            {
+                Buffer.BlockCopy(clixmlPayloadBytes, 0, rdoBytes, RemoteDataObjectHeaderLength, clixmlPayloadBytes.Length);
+            }
+
+            using var fragmentsStream = new MemoryStream();
+            Span<byte> header = stackalloc byte[FragmentHeaderLength];
+            int rdoOffset = 0;
+            ulong fragId = 0;
+            while (rdoOffset < rdoBytes.Length)
+            {
+                int chunkLen = Math.Min(DefaultMaxFragmentBlobSize, rdoBytes.Length - rdoOffset);
+                byte outFlags = 0;
+                if (rdoOffset == 0)
+                {
+                    outFlags |= FragmentFlagStart;
+                }
+                if (rdoOffset + chunkLen >= rdoBytes.Length)
+                {
+                    outFlags |= FragmentFlagEnd;
+                }
+
+                BinaryPrimitives.WriteUInt64BigEndian(header.Slice(0, 8), objectId);
+                BinaryPrimitives.WriteUInt64BigEndian(header.Slice(8, 8), fragId++);
+                header[16] = outFlags;
+                BinaryPrimitives.WriteInt32BigEndian(header.Slice(17, 4), chunkLen);
+
+                fragmentsStream.Write(header);
+                fragmentsStream.Write(rdoBytes, rdoOffset, chunkLen);
+                rdoOffset += chunkLen;
+            }
+
+            string base64Payload = Convert.ToBase64String(fragmentsStream.ToArray());
+            string streamName = string.IsNullOrEmpty(frame.Stream) ? "Default" : frame.Stream;
+            return string.Format(
+                CultureInfo.InvariantCulture,
+                "<Data Stream='{0}' PSGuid='{1}'>{2}</Data>",
+                streamName,
+                frame.PsGuid,
+                base64Payload);
+        }
+
+        internal static byte[] SerializeProtoRemotingPayload(object? obj)
+        {
+            using var ms = new MemoryStream();
+            var context = new SerializationContext(
+                depth: 1,
+                options: SerializationOptions.RemotingOptions,
+                cryptoHelper: null);
+            var serializer = new ProtoSerializer(ms, context);
+            serializer.Serialize(obj!);
+            serializer.Done();
+            return ms.ToArray();
+        }
+
+        internal static object? DeserializeProtoRemotingPayload(byte[] protoBytes)
+        {
+            using var ms = new MemoryStream(protoBytes, writable: false);
+            var context = new DeserializationContext(
+                options: DeserializationOptions.RemotingOptions,
+                cryptoHelper: null);
+            var deserializer = new ProtoDeserializer(ms, context);
+            object? result = deserializer.Deserialize();
+            deserializer.Done();
+            return result == null ? null : PSObject.AsPSObject(result);
+        }
+
+        internal static object? DeserializeClixmlRemotingPayload(byte[] buffer, int offset, int count)
+        {
+            if (s_smaDeserializerCtor == null || s_smaDesCtxCtor == null || s_smaDeserializeMethod == null || s_smaDeserializerDoneMethod == null)
+            {
+                throw new InvalidOperationException("Failed to initialize System.Management.Automation.Deserializer reflection bindings.");
+            }
+
+            using var ms = new MemoryStream(buffer, offset, count, writable: false);
+            var xmlSettings = new XmlReaderSettings
+            {
+                CheckCharacters = false,
+                IgnoreComments = false,
+                IgnoreProcessingInstructions = false,
+                MaxCharactersInDocument = 0,
+                XmlResolver = null,
+                ConformanceLevel = ConformanceLevel.Fragment,
+                CloseInput = false
+            };
+
+            using var xmlReader = XmlReader.Create(ms, xmlSettings);
+            object desCtx = s_smaDesCtxCtor.Invoke(new object?[] { s_smaRemotingDesOptions, null });
+            object deserializer = s_smaDeserializerCtor.Invoke(new object?[] { xmlReader, desCtx });
+            object? result = s_smaDeserializeMethod.Invoke(deserializer, Array.Empty<object>());
+            s_smaDeserializerDoneMethod.Invoke(deserializer, Array.Empty<object>());
+            return result == null ? null : PSObject.AsPSObject(result);
+        }
+
+        internal static byte[] SerializeClixmlRemotingPayload(object? obj)
+        {
+            if (s_smaSerializerCtor == null || s_smaSerCtxCtor == null || s_smaSerializeMethod == null || s_smaSerializerDoneMethod == null)
+            {
+                throw new InvalidOperationException("Failed to initialize System.Management.Automation.Serializer reflection bindings.");
+            }
+
+            using var ms = new MemoryStream();
+            var xmlSettings = new XmlWriterSettings
+            {
+                CheckCharacters = false,
+                Indent = false,
+                CloseOutput = false,
+                Encoding = s_utf8NoBom,
+                NewLineHandling = NewLineHandling.None,
+                OmitXmlDeclaration = true,
+                ConformanceLevel = ConformanceLevel.Fragment
+            };
+
+            using (var xmlWriter = XmlWriter.Create(ms, xmlSettings))
+            {
+                object serCtx = s_smaSerCtxCtor.Invoke(new object?[] { 1, s_smaRemotingSerOptions, null });
+                object serializer = s_smaSerializerCtor.Invoke(new object?[] { xmlWriter, serCtx });
+                s_smaSerializeMethod.Invoke(serializer, new object?[] { obj });
+                s_smaSerializerDoneMethod.Invoke(serializer, Array.Empty<object>());
+                xmlWriter.Flush();
+            }
+
+            return ms.ToArray();
+        }
+    }
+}
