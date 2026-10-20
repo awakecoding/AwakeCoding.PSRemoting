@@ -197,6 +197,15 @@ Describe 'Module Manifest Tests' {
         $Manifest.ExportedCmdlets.Keys | Should -Contain 'Update-PSHostProcessEnvironment'
     }
 
+    It 'Exports the PSObject serialization cmdlets' {
+        $expectedCmdlets = @(
+            'Export-PSObject', 'Import-PSObject', 'ConvertTo-PSObject', 'ConvertFrom-PSObject'
+        )
+        foreach ($cmdlet in $expectedCmdlets) {
+            $Manifest.ExportedCmdlets.Keys | Should -Contain $cmdlet
+        }
+    }
+
     It 'Requires PowerShell Core' {
         $Manifest.CompatiblePSEditions | Should -Contain 'Core'
     }

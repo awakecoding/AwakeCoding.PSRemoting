@@ -13,6 +13,7 @@ Install-Module AwakeCoding.PSRemoting
 - **Client Sessions**: Create PSSession objects connected to local PowerShell subprocesses
 - **Custom WinRM Transport**: Connect to PowerShell over WSMan/WinRM using the module's own HTTP/SOAP transport
 - **Server Infrastructure**: Host PowerShell remoting endpoints on TCP, WebSocket, Named Pipe, gRPC, or WinRM transports
+- **PSObject Serialization**: Export, import, and convert `PSObject` instances across Protobuf, CBOR, and CLIXML formats
 - **Process Connection**: Connect to existing PowerShell processes via named pipes
 - **Cross-Platform**: Works on Windows, Linux, and macOS
 
@@ -491,6 +492,35 @@ $session = Connect-PSHostProcess -Process $process
 
 # Enter the connected session
 $session | Enter-PSSession
+```
+
+## PSObject Serialization - Protobuf, CBOR, and CLIXML
+
+`AwakeCoding.PSRemoting` includes unified `PSObject` serialization cmdlets (`Export-PSObject`, `Import-PSObject`, `ConvertTo-PSObject`, `ConvertFrom-PSObject`) supporting 1:1 CLIXML type fidelity across Protobuf, CBOR, and CLIXML formats (`Primitives`, `PSCustomObject`, `Hashtable`, `OrderedDictionary`, `Queue`, `Stack`, `SecureString`, `ErrorRecord`, `ProgressRecord`, `PSMemberSet`, circular/shared references, and `-Depth` controls).
+
+The cmdlets accept `-Format <Protobuf|Cbor|Clixml>` (as well as shorthand names like `Proto` or `Xml`) and automatically infer or detect the format from file extensions (`.pb`, `.cbor`, `.clixml`, `.xml`) or payload headers (`PSPB` magic bytes, CBOR tag `55799`, or XML headers):
+
+```powershell
+# In-memory conversion (CBOR default)
+$bytes = Get-Process | Select-Object -First 5 | ConvertTo-PSObject
+$procs = $bytes | ConvertFrom-PSObject
+
+# Protobuf Base64 string conversion
+$b64 = [PSCustomObject]@{ Name = 'Node1'; Active = $true } | ConvertTo-PSObject -Format Protobuf -AsBase64String
+$obj = $b64 | ConvertFrom-PSObject
+
+# CLIXML in-memory conversion
+$xml = $obj | ConvertTo-PSObject -Format Clixml
+$roundtrip = $xml | ConvertFrom-PSObject
+
+# File export/import with automatic format detection by extension and header
+Get-ChildItem | Export-PSObject -Path .\items.pb
+Get-ChildItem | Export-PSObject -Path .\items.cbor
+Get-ChildItem | Export-PSObject -Path .\items.clixml
+
+$fromProto  = Import-PSObject -Path .\items.pb
+$fromCbor   = Import-PSObject -Path .\items.cbor
+$fromClixml = Import-PSObject -Path .\items.clixml -First 10 -Skip 2
 ```
 
 ## Building and running
