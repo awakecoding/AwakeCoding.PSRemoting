@@ -361,16 +361,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
             private static PSHostGrpcEncoding ResolveConnectionEncoding(ServerCallContext context, PSHostGrpcEncoding defaultEncoding)
             {
                 var entry = context.RequestHeaders.FirstOrDefault(e => e.Key.Equals("x-psremoting-encoding", StringComparison.OrdinalIgnoreCase));
-                if (entry != null)
+                if (entry != null && Enum.TryParse<PSHostGrpcEncoding>(entry.Value, ignoreCase: true, out var parsedEncoding))
                 {
-                    if (entry.Value.Equals("cbor", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return PSHostGrpcEncoding.Cbor;
-                    }
-                    if (entry.Value.Equals("protobuf", StringComparison.OrdinalIgnoreCase))
-                    {
-                        return PSHostGrpcEncoding.Protobuf;
-                    }
+                    return parsedEncoding;
                 }
 
                 return defaultEncoding;
@@ -399,9 +392,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                     if (frame.Kind == PSHostGrpcFrameKind.Data && clientRequestedEncoding)
                     {
-                        outboundCodec.Encoding = frame.PayloadEncoding == PSHostGrpcPayloadEncoding.Cbor
-                            ? PSHostGrpcEncoding.Cbor
-                            : PSHostGrpcEncoding.Protobuf;
+                        outboundCodec.Encoding = PSHostGrpcPsrpCodec.FromWireEncoding(frame.PayloadEncoding);
                     }
 
                     string? packetLine = inboundCodec.DecodeFrameToPacketLine(frame);

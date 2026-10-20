@@ -233,8 +233,9 @@ $server = Start-PSHostServer -TransportType Grpc -Port 0
 $session = New-PSHostSession -GrpcUri $server.GrpcUri
 Invoke-Command -Session $session { $PSVersionTable.PSVersion }
 
-# Use CBOR PSObject encoding instead of Protobuf
+# Use CBOR or CLIXML PSObject encoding instead of Protobuf
 $cborSession = New-PSHostSession -GrpcUri $server.GrpcUri -GrpcEncoding Cbor
+$clixmlSession = New-PSHostSession -GrpcUri $server.GrpcUri -GrpcEncoding Clixml
 
 # Enter the session interactively
 Enter-PSHostSession -GrpcUri $server.GrpcUri

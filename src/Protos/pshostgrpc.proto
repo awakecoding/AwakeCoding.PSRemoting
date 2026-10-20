@@ -26,6 +26,7 @@ message PSHostGrpcFrame {
 enum PSHostGrpcPayloadEncoding {
   Protobuf = 0;
   Cbor = 1;
+  Clixml = 2;
 }
 
 enum PSHostGrpcFrameKind {

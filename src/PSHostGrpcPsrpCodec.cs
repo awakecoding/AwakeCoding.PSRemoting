@@ -300,18 +300,14 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 byte[] runspacePoolId = fullObjectBytes.AsSpan(8, 16).ToArray();
                 byte[] powerShellId = fullObjectBytes.AsSpan(24, 16).ToArray();
 
-                PSHostGrpcPayloadEncoding wireEncoding = Encoding == PSHostGrpcEncoding.Cbor
-                    ? PSHostGrpcPayloadEncoding.Cbor
-                    : PSHostGrpcPayloadEncoding.Protobuf;
+                PSHostGrpcPayloadEncoding wireEncoding = ToWireEncoding(Encoding);
 
                 byte[] binaryPayloadBytes;
                 int clixmlLength = fullObjectBytes.Length - RemoteDataObjectHeaderLength;
                 if (clixmlLength > 0)
                 {
                     object? psObj = DeserializeClixmlRemotingPayload(fullObjectBytes, RemoteDataObjectHeaderLength, clixmlLength);
-                    binaryPayloadBytes = wireEncoding == PSHostGrpcPayloadEncoding.Cbor
-                        ? SerializeCborRemotingPayload(psObj)
-                        : SerializeProtoRemotingPayload(psObj);
+                    binaryPayloadBytes = SerializeRemotingPayload(psObj, wireEncoding);
                 }
                 else
                 {
@@ -447,9 +443,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             PSObject? psObj = null;
             if (binaryPayloadBytes.Length > 0)
             {
-                psObj = (payloadEncoding == PSHostGrpcPayloadEncoding.Cbor
-                    ? DeserializeCborRemotingPayload(binaryPayloadBytes)
-                    : DeserializeProtoRemotingPayload(binaryPayloadBytes)) as PSObject;
+                psObj = DeserializeRemotingPayload(binaryPayloadBytes, payloadEncoding) as PSObject;
             }
 
             Guid rsPoolGuid = runspacePoolId.Length == 16 ? new Guid(runspacePoolId) : Guid.Empty;
@@ -573,9 +567,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             byte[] clixmlPayloadBytes;
             if (binaryPayloadBytes.Length > 0)
             {
-                object? psObj = payloadEncoding == PSHostGrpcPayloadEncoding.Cbor
-                    ? DeserializeCborRemotingPayload(binaryPayloadBytes)
-                    : DeserializeProtoRemotingPayload(binaryPayloadBytes);
+                object? psObj = DeserializeRemotingPayload(binaryPayloadBytes, payloadEncoding);
                 clixmlPayloadBytes = SerializeClixmlRemotingPayload(psObj);
             }
             else
@@ -635,6 +627,46 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 streamName,
                 frame.PsGuid,
                 base64Payload);
+        }
+
+        internal static PSHostGrpcPayloadEncoding ToWireEncoding(PSHostGrpcEncoding encoding)
+        {
+            return encoding switch
+            {
+                PSHostGrpcEncoding.Cbor => PSHostGrpcPayloadEncoding.Cbor,
+                PSHostGrpcEncoding.Clixml => PSHostGrpcPayloadEncoding.Clixml,
+                _ => PSHostGrpcPayloadEncoding.Protobuf
+            };
+        }
+
+        internal static PSHostGrpcEncoding FromWireEncoding(PSHostGrpcPayloadEncoding wireEncoding)
+        {
+            return wireEncoding switch
+            {
+                PSHostGrpcPayloadEncoding.Cbor => PSHostGrpcEncoding.Cbor,
+                PSHostGrpcPayloadEncoding.Clixml => PSHostGrpcEncoding.Clixml,
+                _ => PSHostGrpcEncoding.Protobuf
+            };
+        }
+
+        internal static byte[] SerializeRemotingPayload(object? obj, PSHostGrpcPayloadEncoding wireEncoding)
+        {
+            return wireEncoding switch
+            {
+                PSHostGrpcPayloadEncoding.Cbor => SerializeCborRemotingPayload(obj),
+                PSHostGrpcPayloadEncoding.Clixml => SerializeClixmlRemotingPayload(obj),
+                _ => SerializeProtoRemotingPayload(obj)
+            };
+        }
+
+        internal static object? DeserializeRemotingPayload(byte[] payloadBytes, PSHostGrpcPayloadEncoding wireEncoding)
+        {
+            return wireEncoding switch
+            {
+                PSHostGrpcPayloadEncoding.Cbor => DeserializeCborRemotingPayload(payloadBytes),
+                PSHostGrpcPayloadEncoding.Clixml => DeserializeClixmlRemotingPayload(payloadBytes, 0, payloadBytes.Length),
+                _ => DeserializeProtoRemotingPayload(payloadBytes)
+            };
         }
 
         internal static byte[] SerializeProtoRemotingPayload(object? obj)

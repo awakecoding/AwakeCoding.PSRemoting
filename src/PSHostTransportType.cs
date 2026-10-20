@@ -44,6 +44,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// <summary>
         /// CBOR RFC 8949 PSObject encoding (PSCborSerializer).
         /// </summary>
-        Cbor = 1
+        Cbor = 1,
+
+        /// <summary>
+        /// CLIXML UTF-8 PSObject encoding (System.Management.Automation.Serializer).
+        /// </summary>
+        Clixml = 2
     }
 }

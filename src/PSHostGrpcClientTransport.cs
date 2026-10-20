@@ -563,9 +563,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             if (!_connectionInfo.HasExplicitEncoding)
             {
-                _outboundCodec.Encoding = frame.PayloadEncoding == PSHostGrpcPayloadEncoding.Cbor
-                    ? PSHostGrpcEncoding.Cbor
-                    : PSHostGrpcEncoding.Protobuf;
+                _outboundCodec.Encoding = PSHostGrpcPsrpCodec.FromWireEncoding(frame.PayloadEncoding);
             }
 
             bool hasObject = _inboundCodec.TryDecodeDataFrameToRemoteDataObject(

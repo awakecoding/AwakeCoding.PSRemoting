@@ -1487,6 +1487,54 @@ Describe 'End-to-End Client Transport Tests' {
             $cborRdoData = $rdoType.GetProperty('Data', $rdoFlags).GetValue($cborRdo)
             $cborRdoData.Message | Should -Be 'ProtoTest'
             $cborRdoData.Value | Should -Be 123
+
+            # Verify CLIXML encoding mode on the same PSRP fragment at the same frame level
+            $clixmlCodec = [Activator]::CreateInstance($codecType, @([AwakeCoding.PSRemoting.PowerShell.PSHostGrpcEncoding]::Clixml))
+            $clixmlFrames = @($encodeRawMethod.Invoke($clixmlCodec, @([byte[]]$fragmentBytes.ToArray(), $psId.ToString(), 'Default')))
+            $clixmlFrames | Should -HaveCount 1
+            $clixmlFrame = $clixmlFrames[0]
+            $clixmlFrame.PayloadEncoding.ToString() | Should -Be 'Clixml'
+            $clixmlFrame.Payload.Length | Should -BeGreaterThan 0
+
+            $clixmlText = [System.Text.Encoding]::UTF8.GetString($clixmlFrame.Payload.ToByteArray())
+            $clixmlText | Should -Match '<Obj'
+            $clixmlText | Should -Match 'ProtoTest'
+
+            $clixmlDecodeArgs = [object[]]@($clixmlFrame, [guid]::Empty, $null)
+            $hasClixmlRdo = $tryDecodeRdoMethod.Invoke($codec, $clixmlDecodeArgs)
+            $hasClixmlRdo | Should -BeTrue
+            $clixmlRdo = $clixmlDecodeArgs[2]
+            $clixmlRdoData = $rdoType.GetProperty('Data', $rdoFlags).GetValue($clixmlRdo)
+            $clixmlRdoData.Message | Should -Be 'ProtoTest'
+            $clixmlRdoData.Value | Should -Be 123
+        }
+
+        It 'Round-trips complex objects over CLIXML-encoded gRPC transport (-GrpcEncoding Clixml)' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -GrpcEncoding Clixml -OpenTimeout 15000
+            try {
+                $guid = [guid]::NewGuid()
+                $result = Invoke-Command -Session $session -ScriptBlock {
+                    param($g)
+                    [pscustomobject]@{
+                        Id      = $g
+                        Version = [version]'7.8.9'
+                        Items   = @(300, 'clixml-hello', $true)
+                        Table   = @{ Mode = 'Clixml'; Count = 77 }
+                    }
+                } -ArgumentList $guid -ErrorAction Stop
+
+                $result.Id | Should -Be $guid
+                $result.Version.ToString() | Should -Be '7.8.9'
+                $result.Items | Should -HaveCount 3
+                $result.Items[0] | Should -Be 300
+                $result.Items[1] | Should -Be 'clixml-hello'
+                $result.Items[2] | Should -BeTrue
+                $result.Table['Mode'] | Should -Be 'Clixml'
+                $result.Table['Count'] | Should -Be 77
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
         }
 
         It 'Round-trips complex objects over CBOR-encoded gRPC transport (-GrpcEncoding Cbor)' {
