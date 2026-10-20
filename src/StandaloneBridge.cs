@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
+using System.Linq.Expressions;
 using System.Management.Automation.Internal;
 using System.Management.Automation.Language;
 using System.Management.Automation.Runspaces;
@@ -143,33 +144,85 @@ namespace System.Management.Automation
         }
     }
 
+    internal static class RefIdStrings
+    {
+        private static readonly string[] s_smallIds = CreateSmallIds();
+
+        private static string[] CreateSmallIds()
+        {
+            var arr = new string[256];
+            for (int i = 0; i < arr.Length; i++)
+            {
+                arr[i] = i.ToString(CultureInfo.InvariantCulture);
+            }
+
+            return arr;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static string Format(ulong id) =>
+            id < (ulong)s_smallIds.Length ? s_smallIds[(int)id] : id.ToString(CultureInfo.InvariantCulture);
+    }
+
     internal sealed class ReferenceIdHandlerForSerializer<T> where T : class
     {
         private readonly IDictionary<T, ulong>? _object2refId;
+        private readonly IEqualityComparer<T>? _comparer;
+        private T? _firstKey;
         private ulong _seed;
 
         internal ReferenceIdHandlerForSerializer(IDictionary<T, ulong>? dictionary)
         {
             _object2refId = dictionary;
+            if (dictionary is Dictionary<T, ulong> concreteDict)
+            {
+                _comparer = concreteDict.Comparer;
+            }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal string? SetRefId(T t)
         {
-            if (_object2refId is not null)
+            if (_object2refId is null)
             {
-                ulong refId = _seed++;
-                _object2refId.Add(t, refId);
-                return refId.ToString(CultureInfo.InvariantCulture);
+                return null;
             }
 
-            return null;
+            ulong refId = _seed++;
+            if (refId == 0)
+            {
+                _firstKey = t;
+                return "0";
+            }
+
+            if (refId == 1 && _firstKey is not null)
+            {
+                _object2refId.Add(_firstKey, 0UL);
+            }
+
+            _object2refId.Add(t, refId);
+            return RefIdStrings.Format(refId);
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal string? GetRefId(T t)
         {
-            if (_object2refId is not null && _object2refId.TryGetValue(t, out ulong refId))
+            if (_object2refId is null || _seed == 0)
             {
-                return refId.ToString(CultureInfo.InvariantCulture);
+                return null;
+            }
+
+            if (_seed == 1)
+            {
+                bool isMatch = _comparer is not null
+                    ? _comparer.Equals(_firstKey!, t)
+                    : ReferenceEquals(_firstKey, t);
+                return isMatch ? "0" : null;
+            }
+
+            if (_object2refId.TryGetValue(t, out ulong refId))
+            {
+                return RefIdStrings.Format(refId);
             }
 
             return null;
@@ -178,11 +231,39 @@ namespace System.Management.Automation
 
     internal sealed class ReferenceIdHandlerForDeserializer<T> where T : class
     {
-        private readonly Dictionary<string, T> _refId2object = new(StringComparer.Ordinal);
+        private Dictionary<string, T>? _refId2object;
+        private string? _firstRefId;
+        private T? _firstObject;
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void SetRefId(T o, string refId, bool duplicateRefIdsAllowed)
         {
-            if (_refId2object.ContainsKey(refId) && !duplicateRefIdsAllowed)
+            if (_refId2object is null)
+            {
+                if (_firstRefId is null)
+                {
+                    _firstRefId = refId;
+                    _firstObject = o;
+                    return;
+                }
+
+                if (string.Equals(_firstRefId, refId, StringComparison.Ordinal))
+                {
+                    if (!duplicateRefIdsAllowed)
+                    {
+                        throw new XmlException($"Duplicate RefId: {refId}");
+                    }
+
+                    _firstObject = o;
+                    return;
+                }
+
+                _refId2object = new Dictionary<string, T>(4, StringComparer.Ordinal)
+                {
+                    [_firstRefId] = _firstObject!
+                };
+            }
+            else if (_refId2object.ContainsKey(refId) && !duplicateRefIdsAllowed)
             {
                 throw new XmlException($"Duplicate RefId: {refId}");
             }
@@ -190,8 +271,16 @@ namespace System.Management.Automation
             _refId2object[refId] = o;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal T? GetReferencedObject(string refId)
         {
+            if (_refId2object is null)
+            {
+                return _firstRefId is not null && string.Equals(_firstRefId, refId, StringComparison.Ordinal)
+                    ? _firstObject
+                    : null;
+            }
+
             _refId2object.TryGetValue(refId, out T? result);
             return result;
         }
@@ -199,25 +288,23 @@ namespace System.Management.Automation
 
     internal sealed class WeakReferenceDictionary<T> : IDictionary<object, T>
     {
-        private readonly ConditionalWeakTable<object, StrongBox<T>> _table = new();
+        private Dictionary<object, T>? _table;
 
-        public void Add(object key, T value)
-        {
-            _table.Add(key, new StrongBox<T>(value));
-        }
+        private Dictionary<object, T> Table => _table ??= new Dictionary<object, T>(ReferenceEqualityComparer.Instance);
 
-        public bool ContainsKey(object key) => _table.TryGetValue(key, out _);
+        public void Add(object key, T value) => Table.Add(key, value);
+
+        public bool ContainsKey(object key) => _table is not null && _table.ContainsKey(key);
 
         public ICollection<object> Keys => throw new NotSupportedException();
 
-        public bool Remove(object key) => _table.Remove(key);
+        public bool Remove(object key) => _table is not null && _table.Remove(key);
 
         public bool TryGetValue(object key, out T value)
         {
-            if (_table.TryGetValue(key, out StrongBox<T>? box) && box is not null)
+            if (_table is not null)
             {
-                value = box.Value!;
-                return true;
+                return _table.TryGetValue(key, out value!);
             }
 
             value = default!;
@@ -229,18 +316,14 @@ namespace System.Management.Automation
         public T this[object key]
         {
             get => TryGetValue(key, out T val) ? val : throw new KeyNotFoundException();
-            set
-            {
-                _table.Remove(key);
-                _table.Add(key, new StrongBox<T>(value));
-            }
+            set => Table[key] = value;
         }
 
         public void Add(KeyValuePair<object, T> item) => Add(item.Key, item.Value);
-        public void Clear() => _table.Clear();
-        public bool Contains(KeyValuePair<object, T> item) => TryGetValue(item.Key, out _);
+        public void Clear() => _table?.Clear();
+        public bool Contains(KeyValuePair<object, T> item) => ContainsKey(item.Key);
         public void CopyTo(KeyValuePair<object, T>[] array, int arrayIndex) => throw new NotSupportedException();
-        public int Count => 0;
+        public int Count => _table?.Count ?? 0;
         public bool IsReadOnly => false;
         public bool Remove(KeyValuePair<object, T> item) => Remove(item.Key);
         public IEnumerator<KeyValuePair<object, T>> GetEnumerator() => throw new NotSupportedException();
@@ -321,88 +404,63 @@ namespace System.Management.Automation
         }
     }
 
-    internal sealed class PSMemberInfoInternalCollection<T> : Collection<T> where T : PSMemberInfo
+    internal sealed class PSMemberInfoInternalCollection<T> : IEnumerable<T> where T : PSMemberInfo
     {
-        private readonly Dictionary<string, T> _byName = new(StringComparer.OrdinalIgnoreCase);
-        private readonly object? _smaBackingCollection;
-        private readonly MethodInfo? _smaBackingAdd;
+        internal PSMemberInfoCollection<T> InnerCollection { get; }
 
         internal PSMemberInfoInternalCollection()
         {
+            InnerCollection = SmaInternalBridge.CreateSmaInternalMemberCollection<T>();
         }
 
-        internal PSMemberInfoInternalCollection(object? smaBackingCollection)
+        internal PSMemberInfoInternalCollection(PSMemberInfoCollection<T> innerCollection)
         {
-            _smaBackingCollection = smaBackingCollection;
-            if (smaBackingCollection is not null)
-            {
-                _smaBackingAdd = smaBackingCollection.GetType().GetMethod("Add", new[] { typeof(T), typeof(bool) })
-                    ?? smaBackingCollection.GetType().GetMethod("Add", new[] { typeof(T) });
-
-                if (smaBackingCollection is IEnumerable enumerable)
-                {
-                    foreach (object? item in enumerable)
-                    {
-                        if (item is T typed)
-                        {
-                            base.InsertItem(Count, typed);
-                            if (typed.Name is not null)
-                            {
-                                _byName[typed.Name] = typed;
-                            }
-                        }
-                    }
-                }
-            }
+            InnerCollection = innerCollection;
         }
 
         public T? this[string name]
         {
-            get
-            {
-                _byName.TryGetValue(name, out T? item);
-                return item;
-            }
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            get => InnerCollection[name];
         }
 
-        protected override void InsertItem(int index, T item)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Add(T item)
         {
-            if (item is null)
+            if (item is not null)
             {
-                return;
-            }
-
-            if (_smaBackingCollection is not null && _smaBackingAdd is not null)
-            {
-                if (_smaBackingAdd.GetParameters().Length == 2)
-                {
-                    _smaBackingAdd.Invoke(_smaBackingCollection, new object[] { item, false });
-                }
-                else
-                {
-                    _smaBackingAdd.Invoke(_smaBackingCollection, new object[] { item });
-                }
-            }
-
-            base.InsertItem(index, item);
-            if (item.Name is not null)
-            {
-                _byName[item.Name] = item;
+                InnerCollection.Add(item);
             }
         }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Add(T item, bool preValidated)
+        {
+            if (item is not null)
+            {
+                InnerCollection.Add(item, preValidated);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public IEnumerator<T> GetEnumerator() => InnerCollection.GetEnumerator();
+
+        IEnumerator IEnumerable.GetEnumerator() => InnerCollection.GetEnumerator();
     }
 
-    internal sealed class PSMemberInfoIntegratingCollection<T> where T : PSMemberInfo
+    internal readonly struct PSMemberInfoIntegratingCollection<T> where T : PSMemberInfo
     {
         private readonly PSObject _source;
         private readonly object? _smaCollections;
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal PSMemberInfoIntegratingCollection(PSObject source, Collection<CollectionEntry<T>>? collections)
         {
             _source = source;
             _smaCollections = collections is { Count: > 0 } ? collections[0].SmaCollection : null;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal IEnumerable<T> Match(string name, PSMemberTypes memberTypes, MshMemberMatchOptions matchOptions)
         {
             return SmaInternalBridge.MatchExtendedMembers<T>(_source, _smaCollections, name, memberTypes, (int)matchOptions);
@@ -414,26 +472,91 @@ namespace System.Management.Automation
         internal static readonly ConsolidatedString Empty = new(Array.Empty<string>());
         internal static readonly IEqualityComparer<ConsolidatedString> EqualityComparer = new ConsolidatedStringEqualityComparer();
 
+        private string? _key;
+        private int _hashCode;
+        private bool _hasHashCode;
+        internal Collection<string>? SmaInstance;
+
         internal ConsolidatedString(IEnumerable<string> strings)
         {
-            if (strings is not null)
+            if (strings is Collection<string> smaCol && SmaInternalBridge.IsSmaConsolidatedString(smaCol))
+            {
+                SmaInstance = smaCol;
+                for (int i = 0; i < smaCol.Count; i++)
+                {
+                    string s = smaCol[i];
+                    if (!string.IsNullOrEmpty(s))
+                    {
+                        Items.Add(s);
+                    }
+                }
+            }
+            else if (strings is not null)
             {
                 foreach (string s in strings)
                 {
                     if (!string.IsNullOrEmpty(s))
                     {
-                        Add(s);
+                        Items.Add(s);
                     }
                 }
             }
         }
 
         internal ConsolidatedString(ConsolidatedString other)
-            : this((IEnumerable<string>)other)
+            : base(new List<string>(other.Items))
         {
+            _key = other._key;
+            _hashCode = other._hashCode;
+            _hasHashCode = other._hasHashCode;
+            SmaInstance = other.SmaInstance;
         }
 
-        internal string Key => string.Join(" ", this);
+        protected override void InsertItem(int index, string item)
+        {
+            base.InsertItem(index, item);
+            _key = null;
+            _hasHashCode = false;
+            SmaInstance = null;
+        }
+
+        protected override void SetItem(int index, string item)
+        {
+            base.SetItem(index, item);
+            _key = null;
+            _hasHashCode = false;
+            SmaInstance = null;
+        }
+
+        protected override void RemoveItem(int index)
+        {
+            base.RemoveItem(index);
+            _key = null;
+            _hasHashCode = false;
+            SmaInstance = null;
+        }
+
+        protected override void ClearItems()
+        {
+            base.ClearItems();
+            _key = null;
+            _hasHashCode = false;
+            SmaInstance = null;
+        }
+
+        internal string Key => _key ??= string.Join(" ", Items);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal int GetCachedHashCode()
+        {
+            if (!_hasHashCode)
+            {
+                _hashCode = Key.GetHashCode(StringComparison.Ordinal);
+                _hasHashCode = true;
+            }
+
+            return _hashCode;
+        }
 
         private sealed class ConsolidatedStringEqualityComparer : IEqualityComparer<ConsolidatedString>
         {
@@ -460,7 +583,7 @@ namespace System.Management.Automation
                 return true;
             }
 
-            public int GetHashCode(ConsolidatedString obj) => obj.Key.GetHashCode(StringComparison.Ordinal);
+            public int GetHashCode(ConsolidatedString obj) => obj.GetCachedHashCode();
         }
     }
 
@@ -495,9 +618,22 @@ namespace System.Management.Automation
 
     internal static class InternalDeserializer
     {
-        private static readonly MethodInfo? s_loadUnsafeXmlDocument =
-            typeof(PSObject).Assembly.GetType("System.Management.Automation.InternalDeserializer")
-                ?.GetMethod("LoadUnsafeXmlDocument", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public, null, new[] { typeof(string), typeof(bool), typeof(int?) }, null);
+        private static readonly Func<string, bool, int?, XmlDocument>? s_loadUnsafeXmlDocument = CompileLoadUnsafeXmlDocument();
+
+        private static Func<string, bool, int?, XmlDocument>? CompileLoadUnsafeXmlDocument()
+        {
+            MethodInfo? method = typeof(PSObject).Assembly
+                .GetType("System.Management.Automation.InternalDeserializer")
+                ?.GetMethod(
+                    "LoadUnsafeXmlDocument",
+                    BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public,
+                    null,
+                    new[] { typeof(string), typeof(bool), typeof(int?) },
+                    null);
+            return method is not null
+                ? (Func<string, bool, int?, XmlDocument>)Delegate.CreateDelegate(typeof(Func<string, bool, int?, XmlDocument>), method)
+                : null;
+        }
 
         internal static XmlDocument LoadUnsafeXmlDocument(
             string xmlText,
@@ -506,7 +642,7 @@ namespace System.Management.Automation
         {
             if (s_loadUnsafeXmlDocument is not null)
             {
-                return (XmlDocument)s_loadUnsafeXmlDocument.Invoke(null, new object?[] { xmlText, preserveNonElements, maxCharactersInDocument })!;
+                return s_loadUnsafeXmlDocument(xmlText, preserveNonElements, maxCharactersInDocument);
             }
 
             var settings = new XmlReaderSettings
@@ -523,32 +659,24 @@ namespace System.Management.Automation
         }
     }
 
-    internal sealed class AdapterProxy
+    internal readonly struct AdapterProxy
     {
         private readonly object? _adapter;
-        private readonly MethodInfo? _baseGetTypeNameHierarchy;
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal AdapterProxy(object? adapter)
         {
             _adapter = adapter;
-            _baseGetTypeNameHierarchy = adapter?.GetType().GetMethod(
-                "BaseGetTypeNameHierarchy",
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         }
 
         internal Collection<string> BaseGetTypeNameHierarchy(object? baseObject)
         {
-            if (_adapter is not null && _baseGetTypeNameHierarchy is not null && baseObject is not null)
+            if (_adapter is not null && baseObject is not null)
             {
-                if (_baseGetTypeNameHierarchy.Invoke(_adapter, new[] { baseObject }) is IEnumerable<string> names)
+                Collection<string>? names = SmaInternalBridge.InvokeAdapterBaseGetTypeNameHierarchy(_adapter, baseObject);
+                if (names is not null)
                 {
-                    var list = new Collection<string>();
-                    foreach (string s in names)
-                    {
-                        list.Add(s);
-                    }
-
-                    return list;
+                    return names;
                 }
             }
 
@@ -565,7 +693,7 @@ namespace System.Management.Automation
     internal sealed class DotNetAdapterProxy
     {
         private readonly object? _dotNetAdapter;
-        private readonly MethodInfo? _getDotNetMethod;
+        private readonly MethodInfo? _getDotNetMethodDefinition;
 
         internal DotNetAdapterProxy(object? dotNetAdapter)
         {
@@ -576,21 +704,47 @@ namespace System.Management.Automation
                 {
                     if (m.Name == "GetDotNetMethod" && m.IsGenericMethodDefinition)
                     {
-                        _getDotNetMethod = m;
+                        _getDotNetMethodDefinition = m;
                         break;
                     }
                 }
             }
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal T? GetDotNetMethod<T>(object obj, string methodName) where T : PSMemberInfo
         {
-            if (_dotNetAdapter is not null && _getDotNetMethod is not null)
+            if (_dotNetAdapter is not null && _getDotNetMethodDefinition is not null)
             {
-                return _getDotNetMethod.MakeGenericMethod(typeof(T)).Invoke(_dotNetAdapter, new[] { obj, methodName }) as T;
+                return DotNetMethodCache<T>.GetOrCreate(_dotNetAdapter.GetType(), _getDotNetMethodDefinition)(_dotNetAdapter, obj, methodName);
             }
 
             return null;
+        }
+
+        private static class DotNetMethodCache<T> where T : PSMemberInfo
+        {
+            private static Func<object, object, string, T?>? s_delegate;
+
+            [MethodImpl(MethodImplOptions.AggressiveInlining)]
+            internal static Func<object, object, string, T?> GetOrCreate(Type adapterType, MethodInfo openMethod)
+            {
+                return s_delegate ??= Compile(adapterType, openMethod);
+            }
+
+            private static Func<object, object, string, T?> Compile(Type adapterType, MethodInfo openMethod)
+            {
+                MethodInfo closed = openMethod.MakeGenericMethod(typeof(T));
+                ParameterExpression adapter = Expression.Parameter(typeof(object), "adapter");
+                ParameterExpression obj = Expression.Parameter(typeof(object), "obj");
+                ParameterExpression methodName = Expression.Parameter(typeof(string), "methodName");
+                MethodCallExpression call = Expression.Call(
+                    Expression.Convert(adapter, adapterType),
+                    closed,
+                    obj,
+                    methodName);
+                return Expression.Lambda<Func<object, object, string, T?>>(call, adapter, obj, methodName).Compile();
+            }
         }
     }
 
@@ -600,248 +754,727 @@ namespace System.Management.Automation
         private const BindingFlags AllInstance = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
         private const BindingFlags AllStatic = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
 
-        private static readonly PropertyInfo? s_psoImmediateBaseObjectIsEmpty =
-            typeof(PSObject).GetProperty("ImmediateBaseObjectIsEmpty", AllInstance);
-        private static readonly PropertyInfo? s_psoToStringFromDeserialization =
-            typeof(PSObject).GetProperty("ToStringFromDeserialization", AllInstance);
-        private static readonly PropertyInfo? s_psoTokenText =
-            typeof(PSObject).GetProperty("TokenText", AllInstance);
-        private static readonly PropertyInfo? s_psoIsDeserialized =
-            typeof(PSObject).GetProperty("IsDeserialized", AllInstance);
-        private static readonly MethodInfo? s_psoAsPSObjectPreserveToString =
-            typeof(PSObject).GetMethod("AsPSObject", AllStatic, null, new[] { typeof(object), typeof(bool) }, null);
-        private static readonly MethodInfo? s_psoSetCoreOnDeserialization =
-            typeof(PSObject).GetMethod("SetCoreOnDeserialization", AllInstance);
-        private static readonly MethodInfo? s_psoGetSerializationMethod =
-            typeof(PSObject).GetMethod("GetSerializationMethod", AllInstance);
-        private static readonly MethodInfo? s_psoGetSerializationDepth =
-            typeof(PSObject).GetMethod("GetSerializationDepth", AllInstance);
-        private static readonly MethodInfo? s_psoGetStringSerializationSource =
-            typeof(PSObject).GetMethod("GetStringSerializationSource", AllInstance);
-        private static readonly MethodInfo? s_psoShouldSerializeAdapter =
-            typeof(PSObject).GetMethod("ShouldSerializeAdapter", AllInstance);
-        private static readonly MethodInfo? s_psoGetTargetTypeForDeserialization =
-            typeof(PSObject).GetMethod("GetTargetTypeForDeserialization", AllInstance);
-        private static readonly MethodInfo? s_psoGetSpecificPropertiesToSerialize =
-            typeof(PSObject).GetMethod("GetSpecificPropertiesToSerialize", AllInstance);
-        private static readonly MethodInfo? s_psoCopyDeserializerFields =
-            typeof(PSObject).GetMethod("CopyDeserializerFields", AllStatic);
-        private static readonly PropertyInfo? s_psoAdaptedMembers =
-            typeof(PSObject).GetProperty("AdaptedMembers", AllInstance);
-        private static readonly PropertyInfo? s_psoClrMembers =
-            typeof(PSObject).GetProperty("ClrMembers", AllInstance);
-        private static readonly PropertyInfo? s_psoInstanceMembers =
-            typeof(PSObject).GetProperty("InstanceMembers", AllInstance);
-        private static readonly PropertyInfo? s_psoInternalAdapter =
-            typeof(PSObject).GetProperty("InternalAdapter", AllInstance);
-        private static readonly FieldInfo? s_psoDotNetInstanceAdapterField =
-            typeof(PSObject).GetField("DotNetInstanceAdapter", AllStatic);
-        private static readonly PropertyInfo? s_psoDotNetInstanceAdapterProp =
-            typeof(PSObject).GetProperty("DotNetInstanceAdapter", AllStatic);
-
-        private static readonly PropertyInfo? s_memberShouldSerialize =
-            typeof(PSMemberInfo).GetProperty("ShouldSerialize", AllInstance);
-        private static readonly PropertyInfo? s_aliasReferencedMember =
-            typeof(PSAliasProperty).GetProperty("ReferencedMember", AllInstance);
-        private static readonly ConstructorInfo? s_psPropertyCtor =
-            typeof(PSProperty).GetConstructor(AllInstance, null, new[] { typeof(string), typeof(object) }, null);
-
-        private static readonly MethodInfo? s_errorRecordToPSObjectForRemoting =
-            typeof(ErrorRecord).GetMethod("ToPSObjectForRemoting", AllInstance, null, new[] { typeof(PSObject) }, null);
-        private static readonly MethodInfo? s_informationalRecordToPSObjectForRemoting =
-            typeof(InformationalRecord).GetMethod("ToPSObjectForRemoting", AllInstance, null, new[] { typeof(PSObject) }, null);
-        private static readonly MethodInfo? s_scriptBlockCreateDelayParsed =
-            typeof(ScriptBlock).GetMethod("CreateDelayParsedScriptBlock", AllStatic, null, new[] { typeof(string), typeof(bool) }, null);
-
-        private static readonly MethodInfo? s_setHasInstanceMember =
-            s_sma.GetType("System.Management.Automation.Language.PSGetMemberBinder")
-                ?.GetMethod("SetHasInstanceMember", AllStatic);
-
-        private static readonly MethodInfo? s_convertTo5 =
-            typeof(LanguagePrimitives).GetMethod(
-                "ConvertTo",
-                AllStatic,
-                null,
-                new[] { typeof(object), typeof(Type), typeof(bool), typeof(IFormatProvider), typeof(TypeTable) },
-                null);
-
-        private static readonly MethodInfo? s_cryptoEncrypt =
-            typeof(PSRemotingCryptoHelper).GetMethod("EncryptSecureString", AllInstance);
-        private static readonly MethodInfo? s_cryptoDecrypt =
-            typeof(PSRemotingCryptoHelper).GetMethod("DecryptSecureString", AllInstance);
-
+        private static readonly Type? s_smaConsolidatedStringType =
+            s_sma.GetType("System.Management.Automation.Runspaces.ConsolidatedString");
+        private static readonly Type? s_smaAdapterType =
+            s_sma.GetType("System.Management.Automation.Adapter");
         private static readonly Type? s_smaInternalCollectionGeneric =
             s_sma.GetType("System.Management.Automation.PSMemberInfoInternalCollection`1");
         private static readonly Type? s_smaIntegratingCollectionGeneric =
             s_sma.GetType("System.Management.Automation.PSMemberInfoIntegratingCollection`1");
         private static readonly Type? s_mshMemberMatchOptionsType =
             s_sma.GetType("System.Management.Automation.MshMemberMatchOptions");
-        private static readonly MethodInfo? s_psoGetMemberCollection =
-            typeof(PSObject).GetMethod("GetMemberCollection", AllStatic, null, new[] { typeof(PSMemberViewTypes), typeof(TypeTable) }, null);
-        private static readonly MethodInfo? s_psoGetPropertyCollection =
-            typeof(PSObject).GetMethod("GetPropertyCollection", AllStatic, null, new[] { typeof(PSMemberViewTypes), typeof(TypeTable) }, null);
-        private static readonly MethodInfo? s_smaGetSpecificPropertiesToSerialize =
-            s_sma.GetType("System.Management.Automation.SerializationUtilities")
-                ?.GetMethod("GetSpecificPropertiesToSerialize", AllStatic);
+
+        // Compiled property getters/setters on PSObject
+        private static readonly Func<PSObject, bool>? s_getImmediateBaseObjectIsEmpty =
+            CompileInstancePropertyGetter<PSObject, bool>("ImmediateBaseObjectIsEmpty");
+        private static readonly Func<PSObject, string?>? s_getToStringFromDeserialization =
+            CompileInstancePropertyGetter<PSObject, string?>("ToStringFromDeserialization");
+        private static readonly Action<PSObject, string?>? s_setToStringFromDeserialization =
+            CompileInstancePropertySetter<PSObject, string?>("ToStringFromDeserialization");
+        private static readonly Func<PSObject, string?>? s_getTokenText =
+            CompileInstancePropertyGetter<PSObject, string?>("TokenText");
+        private static readonly Action<PSObject, string?>? s_setTokenText =
+            CompileInstancePropertySetter<PSObject, string?>("TokenText");
+        private static readonly Func<PSObject, bool>? s_getIsDeserialized =
+            CompileInstancePropertyGetter<PSObject, bool>("IsDeserialized");
+        private static readonly Action<PSObject, bool>? s_setIsDeserialized =
+            CompileInstancePropertySetter<PSObject, bool>("IsDeserialized");
+        private static readonly Func<PSObject, object?>? s_getInternalAdapter =
+            CompileInstancePropertyGetterAsObject<PSObject>("InternalAdapter");
+        private static readonly Func<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>? s_getAdaptedMembers =
+            CompileInstancePropertyGetterCast<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>("AdaptedMembers");
+        private static readonly Action<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>? s_setAdaptedMembers =
+            CompileInstancePropertySetterCast<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>("AdaptedMembers");
+        private static readonly Func<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>? s_getClrMembers =
+            CompileInstancePropertyGetterCast<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>("ClrMembers");
+        private static readonly Action<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>? s_setClrMembers =
+            CompileInstancePropertySetterCast<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>("ClrMembers");
+        private static readonly Func<PSObject, PSMemberInfoCollection<PSMemberInfo>?>? s_getInstanceMembers =
+            CompileInstancePropertyGetterCast<PSObject, PSMemberInfoCollection<PSMemberInfo>?>("InstanceMembers");
+        private static readonly Func<PSObject, Collection<string>?>? s_getInternalTypeNames =
+            CompileInstancePropertyGetterCast<PSObject, Collection<string>?>("InternalTypeNames");
+        private static readonly Action<PSObject, Collection<string>>? s_setInternalTypeNames =
+            CompileInternalTypeNamesSetter();
+        private static readonly Func<IEnumerable<string>, Collection<string>>? s_createSmaConsolidatedString =
+            CompileCreateSmaConsolidatedString();
+
+        // Fast non-allocating checks on PSObject
+        private static readonly Func<PSObject, PSMemberInfoCollection<PSMemberInfo>?>? s_tryGetNonEmptyInstanceMembers =
+            CompileTryGetNonEmptyInstanceMembers();
+        private static readonly Func<PSObject, bool>? s_hasInstanceTypeNameCheck = CompileHasInstanceTypeNameCheck();
+        private static readonly Func<PSObject, TypeTable?, bool>? s_hasTypeTableMembersCheck = CompileHasTypeTableMembersCheck();
+
+        // Compiled methods on PSObject
+        private static readonly Func<object, bool, PSObject>? s_asPSObjectPreserveToString =
+            CompileStaticDelegate<Func<object, bool, PSObject>>(
+                typeof(PSObject).GetMethod("AsPSObject", AllStatic, null, new[] { typeof(object), typeof(bool) }, null));
+        private static readonly Action<PSObject, object?, bool>? s_setCoreOnDeserialization =
+            CompileStaticOrInstanceDelegate<Action<PSObject, object?, bool>>(
+                typeof(PSObject).GetMethod("SetCoreOnDeserialization", AllInstance));
+        private static readonly Action<PSObject, PSObject>? s_copyDeserializerFields =
+            CompileStaticDelegate<Action<PSObject, PSObject>>(
+                typeof(PSObject).GetMethod("CopyDeserializerFields", AllStatic));
+        private static readonly Func<PSObject, TypeTable?, int>? s_getSerializationMethod =
+            CompileGetSerializationMethod();
+        private static readonly Func<PSObject, TypeTable?, int>? s_getSerializationDepth =
+            CompileStaticOrInstanceDelegate<Func<PSObject, TypeTable?, int>>(
+                typeof(PSObject).GetMethod("GetSerializationDepth", AllInstance));
+        private static readonly Func<PSObject, TypeTable?, PSPropertyInfo?>? s_getStringSerializationSource =
+            CompileStaticOrInstanceDelegate<Func<PSObject, TypeTable?, PSPropertyInfo?>>(
+                typeof(PSObject).GetMethod("GetStringSerializationSource", AllInstance));
+        private static readonly Func<PSObject, bool>? s_shouldSerializeAdapter =
+            CompileStaticOrInstanceDelegate<Func<PSObject, bool>>(
+                typeof(PSObject).GetMethod("ShouldSerializeAdapter", AllInstance));
+        private static readonly Func<PSObject, TypeTable?, Type?>? s_getTargetTypeForDeserialization =
+            CompileStaticOrInstanceDelegate<Func<PSObject, TypeTable?, Type?>>(
+                typeof(PSObject).GetMethod("GetTargetTypeForDeserialization", AllInstance));
+        private static readonly Func<PSObject, TypeTable?, Collection<string>?>? s_getSpecificPropertiesToSerialize =
+            CompileStaticOrInstanceDelegate<Func<PSObject, TypeTable?, Collection<string>?>>(
+                typeof(PSObject).GetMethod("GetSpecificPropertiesToSerialize", AllInstance));
+        private static readonly Func<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>? s_getAdaptedProperties =
+            CompileGetAdaptedProperties();
+        private static readonly Func<PSMemberViewTypes, TypeTable?, object?>? s_psoGetMemberCollection =
+            CompileGetCollectionMethod("GetMemberCollection");
+        private static readonly Func<PSMemberViewTypes, TypeTable?, object?>? s_psoGetPropertyCollection =
+            CompileGetCollectionMethod("GetPropertyCollection");
+        private static readonly Func<PSObject, object, TypeTable?, PSMemberInfoCollection<PSPropertyInfo>?>? s_smaGetSpecificPropertiesToSerialize =
+            CompileSmaGetSpecificPropertiesToSerialize();
+
+        // Cached default member/property collections when backupTypeTable is null
+        private static readonly Collection<CollectionEntry<PSMemberInfo>> s_defaultExtendedMemberCollection =
+            CreateMemberCollectionCore(PSMemberViewTypes.Extended, null);
+        private static readonly Collection<CollectionEntry<PSPropertyInfo>> s_defaultAllPropertyCollection =
+            CreatePropertyCollectionCore(PSMemberViewTypes.Extended | PSMemberViewTypes.Adapted | PSMemberViewTypes.Base, null);
+
+        // Cache mapping SMA ConsolidatedString instances to our ConsolidatedString wrapper
+        private static readonly ConditionalWeakTable<Collection<string>, ConsolidatedString> s_typeNamesCache = new();
+
+        // Compiled getters/ctors for PSMemberInfo / PSAliasProperty / PSProperty / Adapter / etc.
+        private static readonly Func<PSMemberInfo, bool>? s_getMemberShouldSerialize =
+            CompileInstancePropertyGetter<PSMemberInfo, bool>("ShouldSerialize");
+        private static readonly Func<PSAliasProperty, PSMemberInfo?>? s_getAliasReferencedMember =
+            CompileInstancePropertyGetter<PSAliasProperty, PSMemberInfo?>("ReferencedMember");
+        private static readonly Func<string, object?, PSProperty>? s_createPsProperty =
+            CompileCreatePsProperty();
+        private static readonly Func<object, object, Collection<string>?>? s_adapterBaseGetTypeNameHierarchy =
+            CompileAdapterBaseGetTypeNameHierarchy();
+        private static readonly Action<ErrorRecord, PSObject>? s_errorRecordToPSObjectForRemoting =
+            CompileStaticOrInstanceDelegate<Action<ErrorRecord, PSObject>>(
+                typeof(ErrorRecord).GetMethod("ToPSObjectForRemoting", AllInstance, null, new[] { typeof(PSObject) }, null));
+        private static readonly Action<InformationalRecord, PSObject>? s_informationalRecordToPSObjectForRemoting =
+            CompileStaticOrInstanceDelegate<Action<InformationalRecord, PSObject>>(
+                typeof(InformationalRecord).GetMethod("ToPSObjectForRemoting", AllInstance, null, new[] { typeof(PSObject) }, null));
+        private static readonly Func<string, bool, ScriptBlock>? s_scriptBlockCreateDelayParsed =
+            CompileStaticDelegate<Func<string, bool, ScriptBlock>>(
+                typeof(ScriptBlock).GetMethod("CreateDelayParsedScriptBlock", AllStatic, null, new[] { typeof(string), typeof(bool) }, null));
+        private static readonly Action<string>? s_setHasInstanceMember =
+            CompileStaticDelegate<Action<string>>(
+                s_sma.GetType("System.Management.Automation.Language.PSGetMemberBinder")?.GetMethod("SetHasInstanceMember", AllStatic));
+        private static readonly Func<object?, Type, bool, IFormatProvider, TypeTable?, object?>? s_convertTo5 =
+            CompileStaticDelegate<Func<object?, Type, bool, IFormatProvider, TypeTable?, object?>>(
+                typeof(LanguagePrimitives).GetMethod(
+                    "ConvertTo",
+                    AllStatic,
+                    null,
+                    new[] { typeof(object), typeof(Type), typeof(bool), typeof(IFormatProvider), typeof(TypeTable) },
+                    null));
+        private static readonly Func<PSRemotingCryptoHelper, SecureString, string>? s_cryptoEncrypt =
+            CompileStaticOrInstanceDelegate<Func<PSRemotingCryptoHelper, SecureString, string>>(
+                typeof(PSRemotingCryptoHelper).GetMethod("EncryptSecureString", AllInstance));
+        private static readonly Func<PSRemotingCryptoHelper, string, SecureString>? s_cryptoDecrypt =
+            CompileStaticOrInstanceDelegate<Func<PSRemotingCryptoHelper, string, SecureString>>(
+                typeof(PSRemotingCryptoHelper).GetMethod("DecryptSecureString", AllInstance));
+
+        private static readonly FieldInfo? s_psoDotNetInstanceAdapterField =
+            typeof(PSObject).GetField("DotNetInstanceAdapter", AllStatic);
+        private static readonly PropertyInfo? s_psoDotNetInstanceAdapterProp =
+            typeof(PSObject).GetProperty("DotNetInstanceAdapter", AllStatic);
 
         private static readonly DotNetAdapterProxy s_dotNetAdapterProxy = new(
             s_psoDotNetInstanceAdapterField?.GetValue(null) ?? s_psoDotNetInstanceAdapterProp?.GetValue(null));
 
+        // Cached GetType and ToString PSMemberInfo Templates or direct lookups
         internal static DotNetAdapterProxy DotNetInstanceAdapter => s_dotNetAdapterProxy;
 
-        internal static AdapterProxy GetInternalAdapter(PSObject pso)
-            => new AdapterProxy(s_psoInternalAdapter?.GetValue(pso));
+        private static TDelegate? CompileStaticDelegate<TDelegate>(MethodInfo? method)
+            where TDelegate : class, Delegate =>
+            method is not null ? (TDelegate)Delegate.CreateDelegate(typeof(TDelegate), method) : null;
 
-        internal static bool GetImmediateBaseObjectIsEmpty(PSObject pso)
+        private static TDelegate? CompileStaticOrInstanceDelegate<TDelegate>(MethodInfo? method)
+            where TDelegate : class, Delegate =>
+            method is not null ? (TDelegate)Delegate.CreateDelegate(typeof(TDelegate), method) : null;
+
+        private static Func<TTarget, TValue>? CompileInstancePropertyGetter<TTarget, TValue>(string propertyName)
         {
-            if (s_psoImmediateBaseObjectIsEmpty is not null)
-            {
-                return (bool)s_psoImmediateBaseObjectIsEmpty.GetValue(pso)!;
-            }
-
-            return pso.ImmediateBaseObject is PSCustomObject;
+            MethodInfo? getter = typeof(TTarget).GetProperty(propertyName, AllInstance)?.GetGetMethod(nonPublic: true);
+            return getter is not null ? (Func<TTarget, TValue>)Delegate.CreateDelegate(typeof(Func<TTarget, TValue>), getter) : null;
         }
 
-        internal static string? GetToStringFromDeserialization(PSObject pso)
-            => s_psoToStringFromDeserialization?.GetValue(pso) as string;
-
-        internal static void SetToStringFromDeserialization(PSObject pso, string? value)
-            => s_psoToStringFromDeserialization?.SetValue(pso, value);
-
-        internal static string? GetTokenText(PSObject pso)
-            => s_psoTokenText?.GetValue(pso) as string;
-
-        internal static void SetTokenText(PSObject pso, string? value)
-            => s_psoTokenText?.SetValue(pso, value);
-
-        internal static bool GetIsDeserialized(PSObject pso)
-            => s_psoIsDeserialized is not null && (bool)s_psoIsDeserialized.GetValue(pso)!;
-
-        internal static void SetIsDeserialized(PSObject pso, bool value)
-            => s_psoIsDeserialized?.SetValue(pso, value);
-
-        internal static void SetCoreOnDeserialization(PSObject pso, object? value, bool overrideTypeInfo)
-            => s_psoSetCoreOnDeserialization?.Invoke(pso, new object?[] { value, overrideTypeInfo });
-
-        internal static void CopyDeserializerFields(PSObject source, PSObject target)
-            => s_psoCopyDeserializerFields?.Invoke(null, new object[] { source, target });
-
-        internal static PSObject AsPSObjectWithPreserveToString(object obj, bool preserveToString)
+        private static Action<TTarget, TValue>? CompileInstancePropertySetter<TTarget, TValue>(string propertyName)
         {
-            if (s_psoAsPSObjectPreserveToString is not null)
-            {
-                return (PSObject)s_psoAsPSObjectPreserveToString.Invoke(null, new object?[] { obj, preserveToString })!;
-            }
-
-            return PSObject.AsPSObject(obj);
+            MethodInfo? setter = typeof(TTarget).GetProperty(propertyName, AllInstance)?.GetSetMethod(nonPublic: true);
+            return setter is not null ? (Action<TTarget, TValue>)Delegate.CreateDelegate(typeof(Action<TTarget, TValue>), setter) : null;
         }
 
-        internal static SerializationMethod GetSerializationMethod(PSObject pso, TypeTable? typeTable)
+        private static Func<TTarget, object?>? CompileInstancePropertyGetterAsObject<TTarget>(string propertyName)
         {
-            if (s_psoGetSerializationMethod is not null)
+            PropertyInfo? prop = typeof(TTarget).GetProperty(propertyName, AllInstance);
+            if (prop is null)
             {
-                object? res = s_psoGetSerializationMethod.Invoke(pso, new object?[] { typeTable });
-                if (res is not null)
-                {
-                    return (SerializationMethod)(int)res;
-                }
+                return null;
             }
 
-            return SerializationMethod.AllPublicProperties;
+            ParameterExpression target = Expression.Parameter(typeof(TTarget), "target");
+            UnaryExpression body = Expression.Convert(Expression.Property(target, prop), typeof(object));
+            return Expression.Lambda<Func<TTarget, object?>>(body, target).Compile();
         }
 
-        internal static int GetSerializationDepth(PSObject pso, TypeTable? typeTable)
+        private static Func<TTarget, TResult>? CompileInstancePropertyGetterCast<TTarget, TResult>(string propertyName)
         {
-            if (s_psoGetSerializationDepth is not null)
+            PropertyInfo? prop = typeof(TTarget).GetProperty(propertyName, AllInstance);
+            if (prop is null)
             {
-                object? res = s_psoGetSerializationDepth.Invoke(pso, new object?[] { typeTable });
-                if (res is int depth)
-                {
-                    return depth;
-                }
+                return null;
             }
 
-            return 0;
+            ParameterExpression target = Expression.Parameter(typeof(TTarget), "target");
+            UnaryExpression body = Expression.Convert(Expression.Property(target, prop), typeof(TResult));
+            return Expression.Lambda<Func<TTarget, TResult>>(body, target).Compile();
         }
 
-        internal static PSPropertyInfo? GetStringSerializationSource(PSObject pso, TypeTable? typeTable)
-            => s_psoGetStringSerializationSource?.Invoke(pso, new object?[] { typeTable }) as PSPropertyInfo;
-
-        internal static bool ShouldSerializeAdapter(PSObject pso)
+        private static Action<TTarget, TValue>? CompileInstancePropertySetterCast<TTarget, TValue>(string propertyName)
         {
-            if (s_psoShouldSerializeAdapter is not null)
+            PropertyInfo? prop = typeof(TTarget).GetProperty(propertyName, AllInstance);
+            if (prop is null)
             {
-                object? res = s_psoShouldSerializeAdapter.Invoke(pso, Array.Empty<object>());
-                if (res is bool b)
-                {
-                    return b;
-                }
+                return null;
             }
 
-            return true;
+            ParameterExpression target = Expression.Parameter(typeof(TTarget), "target");
+            ParameterExpression value = Expression.Parameter(typeof(TValue), "value");
+            BinaryExpression body = Expression.Assign(
+                Expression.Property(target, prop),
+                Expression.Convert(value, prop.PropertyType));
+            return Expression.Lambda<Action<TTarget, TValue>>(body, target, value).Compile();
         }
 
-        internal static Type? GetTargetTypeForDeserialization(PSObject pso, TypeTable? typeTable)
-            => s_psoGetTargetTypeForDeserialization?.Invoke(pso, new object?[] { typeTable }) as Type;
-
-        internal static Collection<string> GetSpecificPropertiesToSerialize(PSObject pso, TypeTable? typeTable)
+        private static Func<IEnumerable<string>, Collection<string>>? CompileCreateSmaConsolidatedString()
         {
-            if (s_psoGetSpecificPropertiesToSerialize is not null)
+            if (s_smaConsolidatedStringType is null)
             {
-                if (s_psoGetSpecificPropertiesToSerialize.Invoke(pso, new object?[] { typeTable }) is Collection<string> col)
-                {
-                    return col;
-                }
+                return null;
             }
 
-            return new Collection<string>();
-        }
-
-        internal static object? CreateSmaInternalPropertyCollection()
-        {
-            if (s_smaInternalCollectionGeneric is not null)
+            ConstructorInfo? enumBoolCtor = s_smaConsolidatedStringType.GetConstructor(
+                AllInstance,
+                null,
+                new[] { typeof(IEnumerable<string>), typeof(bool) },
+                null);
+            if (enumBoolCtor is not null)
             {
-                Type closed = s_smaInternalCollectionGeneric.MakeGenericType(typeof(PSPropertyInfo));
-                return Activator.CreateInstance(closed, nonPublic: true);
+                ParameterExpression strings = Expression.Parameter(typeof(IEnumerable<string>), "strings");
+                UnaryExpression body = Expression.Convert(
+                    Expression.New(enumBoolCtor, strings, Expression.Constant(true)),
+                    typeof(Collection<string>));
+                return Expression.Lambda<Func<IEnumerable<string>, Collection<string>>>(body, strings).Compile();
+            }
+
+            ConstructorInfo? enumCtor = s_smaConsolidatedStringType.GetConstructor(
+                AllInstance,
+                null,
+                new[] { typeof(IEnumerable<string>) },
+                null);
+            if (enumCtor is not null)
+            {
+                ParameterExpression strings = Expression.Parameter(typeof(IEnumerable<string>), "strings");
+                UnaryExpression body = Expression.Convert(
+                    Expression.New(enumCtor, strings),
+                    typeof(Collection<string>));
+                return Expression.Lambda<Func<IEnumerable<string>, Collection<string>>>(body, strings).Compile();
             }
 
             return null;
         }
 
+        private static Action<PSObject, Collection<string>>? CompileInternalTypeNamesSetter()
+        {
+            PropertyInfo? prop = typeof(PSObject).GetProperty("InternalTypeNames", AllInstance);
+            if (prop is null || s_smaConsolidatedStringType is null)
+            {
+                return null;
+            }
+
+            ConstructorInfo? copyCtor = s_smaConsolidatedStringType.GetConstructor(
+                AllInstance,
+                null,
+                new[] { s_smaConsolidatedStringType },
+                null);
+            if (copyCtor is null)
+            {
+                return null;
+            }
+
+            ParameterExpression target = Expression.Parameter(typeof(PSObject), "target");
+            ParameterExpression smaInstance = Expression.Parameter(typeof(Collection<string>), "smaInstance");
+            NewExpression copyExpr = Expression.New(
+                copyCtor,
+                Expression.Convert(smaInstance, s_smaConsolidatedStringType));
+            BinaryExpression assign = Expression.Assign(Expression.Property(target, prop), copyExpr);
+            return Expression.Lambda<Action<PSObject, Collection<string>>>(assign, target, smaInstance).Compile();
+        }
+
+        private static Func<PSObject, PSMemberInfoCollection<PSMemberInfo>?>? CompileTryGetNonEmptyInstanceMembers()
+        {
+            if (s_smaInternalCollectionGeneric is null)
+            {
+                return null;
+            }
+
+            Type internalCollectionType = s_smaInternalCollectionGeneric.MakeGenericType(typeof(PSMemberInfo));
+            MethodInfo? method = typeof(PSObject).GetMethod(
+                "HasInstanceMembers",
+                AllStatic,
+                null,
+                new[] { typeof(object), internalCollectionType.MakeByRefType() },
+                null);
+            if (method is null)
+            {
+                return null;
+            }
+
+            ParameterExpression pso = Expression.Parameter(typeof(PSObject), "pso");
+            ParameterExpression outMembers = Expression.Variable(internalCollectionType, "members");
+            ConditionalExpression body = Expression.Condition(
+                Expression.Call(method, Expression.Convert(pso, typeof(object)), outMembers),
+                Expression.Convert(outMembers, typeof(PSMemberInfoCollection<PSMemberInfo>)),
+                Expression.Constant(null, typeof(PSMemberInfoCollection<PSMemberInfo>)));
+            return Expression.Lambda<Func<PSObject, PSMemberInfoCollection<PSMemberInfo>?>>(
+                Expression.Block(new[] { outMembers }, body),
+                pso).Compile();
+        }
+
+        private static Func<PSObject, TypeTable?, bool>? CompileHasTypeTableMembersCheck()
+        {
+            MethodInfo? target = null;
+            foreach (MethodInfo m in typeof(PSObject).GetMethods(AllStatic))
+            {
+                if (m.Name == "TypeTableGetMembersDelegate" && m.IsGenericMethodDefinition && m.GetParameters().Length == 2)
+                {
+                    target = m.MakeGenericMethod(typeof(PSMemberInfo));
+                    break;
+                }
+            }
+
+            if (target is null)
+            {
+                return null;
+            }
+
+            PropertyInfo? countProp = target.ReturnType.GetProperty("Count", AllInstance);
+            if (countProp is null)
+            {
+                return null;
+            }
+
+            ParameterExpression pso = Expression.Parameter(typeof(PSObject), "pso");
+            ParameterExpression typeTable = Expression.Parameter(typeof(TypeTable), "typeTable");
+            ParameterExpression resultVar = Expression.Variable(target.ReturnType, "members");
+            BlockExpression block = Expression.Block(
+                new[] { resultVar },
+                Expression.Assign(resultVar, Expression.Call(target, pso, typeTable)),
+                Expression.AndAlso(
+                    Expression.NotEqual(resultVar, Expression.Constant(null, target.ReturnType)),
+                    Expression.GreaterThan(Expression.Property(resultVar, countProp), Expression.Constant(0))));
+            return Expression.Lambda<Func<PSObject, TypeTable?, bool>>(block, pso, typeTable).Compile();
+        }
+
+        private static Func<PSObject, bool>? CompileHasInstanceTypeNameCheck()
+        {
+            if (s_smaConsolidatedStringType is null)
+            {
+                return null;
+            }
+
+            MethodInfo? method = typeof(PSObject).GetMethod(
+                "HasInstanceTypeName",
+                AllStatic,
+                null,
+                new[] { typeof(object), s_smaConsolidatedStringType.MakeByRefType() },
+                null);
+            if (method is null)
+            {
+                return null;
+            }
+
+            ParameterExpression pso = Expression.Parameter(typeof(PSObject), "pso");
+            ParameterExpression dummyOut = Expression.Variable(s_smaConsolidatedStringType, "result");
+            BlockExpression block = Expression.Block(
+                new[] { dummyOut },
+                Expression.Call(method, Expression.Convert(pso, typeof(object)), dummyOut));
+            return Expression.Lambda<Func<PSObject, bool>>(block, pso).Compile();
+        }
+
+        private static Func<PSObject, TypeTable?, int>? CompileGetSerializationMethod()
+        {
+            MethodInfo? method = typeof(PSObject).GetMethod("GetSerializationMethod", AllInstance);
+            if (method is null)
+            {
+                return null;
+            }
+
+            ParameterExpression pso = Expression.Parameter(typeof(PSObject), "pso");
+            ParameterExpression typeTable = Expression.Parameter(typeof(TypeTable), "typeTable");
+            UnaryExpression body = Expression.Convert(Expression.Call(pso, method, typeTable), typeof(int));
+            return Expression.Lambda<Func<PSObject, TypeTable?, int>>(body, pso, typeTable).Compile();
+        }
+
+        private static Func<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>? CompileGetAdaptedProperties()
+        {
+            MethodInfo? method = typeof(PSObject).GetMethod("GetAdaptedProperties", AllInstance, null, Type.EmptyTypes, null);
+            if (method is null)
+            {
+                return null;
+            }
+
+            ParameterExpression pso = Expression.Parameter(typeof(PSObject), "pso");
+            UnaryExpression body = Expression.Convert(Expression.Call(pso, method), typeof(PSMemberInfoCollection<PSPropertyInfo>));
+            return Expression.Lambda<Func<PSObject, PSMemberInfoCollection<PSPropertyInfo>?>>(body, pso).Compile();
+        }
+
+        private static Func<PSMemberViewTypes, TypeTable?, object?>? CompileGetCollectionMethod(string methodName)
+        {
+            MethodInfo? method = typeof(PSObject).GetMethod(
+                methodName,
+                AllStatic,
+                null,
+                new[] { typeof(PSMemberViewTypes), typeof(TypeTable) },
+                null);
+            if (method is null)
+            {
+                return null;
+            }
+
+            ParameterExpression viewType = Expression.Parameter(typeof(PSMemberViewTypes), "viewType");
+            ParameterExpression typeTable = Expression.Parameter(typeof(TypeTable), "typeTable");
+            UnaryExpression body = Expression.Convert(Expression.Call(method, viewType, typeTable), typeof(object));
+            return Expression.Lambda<Func<PSMemberViewTypes, TypeTable?, object?>>(body, viewType, typeTable).Compile();
+        }
+
+        private static Func<PSObject, object, TypeTable?, PSMemberInfoCollection<PSPropertyInfo>?>? CompileSmaGetSpecificPropertiesToSerialize()
+        {
+            MethodInfo? method = s_sma.GetType("System.Management.Automation.SerializationUtilities")
+                ?.GetMethod("GetSpecificPropertiesToSerialize", AllStatic);
+            if (method is null)
+            {
+                return null;
+            }
+
+            ParameterInfo[] parameters = method.GetParameters();
+            if (parameters.Length != 3)
+            {
+                return null;
+            }
+
+            ParameterExpression source = Expression.Parameter(typeof(PSObject), "source");
+            ParameterExpression allProps = Expression.Parameter(typeof(object), "allProps");
+            ParameterExpression typeTable = Expression.Parameter(typeof(TypeTable), "typeTable");
+            MethodCallExpression call = Expression.Call(
+                method,
+                source,
+                Expression.Convert(allProps, parameters[1].ParameterType),
+                typeTable);
+            return Expression.Lambda<Func<PSObject, object, TypeTable?, PSMemberInfoCollection<PSPropertyInfo>?>>(
+                Expression.Convert(call, typeof(PSMemberInfoCollection<PSPropertyInfo>)),
+                source,
+                allProps,
+                typeTable).Compile();
+        }
+
+        private static Func<string, object?, PSProperty>? CompileCreatePsProperty()
+        {
+            ConstructorInfo? ctor = typeof(PSProperty).GetConstructor(AllInstance, null, new[] { typeof(string), typeof(object) }, null);
+            if (ctor is null)
+            {
+                return null;
+            }
+
+            ParameterExpression name = Expression.Parameter(typeof(string), "name");
+            ParameterExpression value = Expression.Parameter(typeof(object), "value");
+            return Expression.Lambda<Func<string, object?, PSProperty>>(Expression.New(ctor, name, value), name, value).Compile();
+        }
+
+        private static Func<object, object, Collection<string>?>? CompileAdapterBaseGetTypeNameHierarchy()
+        {
+            if (s_smaAdapterType is null)
+            {
+                return null;
+            }
+
+            MethodInfo? method = s_smaAdapterType.GetMethod("BaseGetTypeNameHierarchy", AllInstance, null, new[] { typeof(object) }, null);
+            if (method is null)
+            {
+                return null;
+            }
+
+            ParameterExpression adapter = Expression.Parameter(typeof(object), "adapter");
+            ParameterExpression baseObj = Expression.Parameter(typeof(object), "baseObj");
+            MethodCallExpression call = Expression.Call(
+                Expression.Convert(adapter, s_smaAdapterType),
+                method,
+                baseObj);
+            return Expression.Lambda<Func<object, object, Collection<string>?>>(
+                Expression.Convert(call, typeof(Collection<string>)),
+                adapter,
+                baseObj).Compile();
+        }
+
+        private static class InternalCollectionFactory<T> where T : PSMemberInfo
+        {
+            internal static readonly Func<PSMemberInfoCollection<T>> Create = CompileFactory();
+
+            private static Func<PSMemberInfoCollection<T>> CompileFactory()
+            {
+                Type closedType = s_smaInternalCollectionGeneric!.MakeGenericType(typeof(T));
+                ConstructorInfo ctor = closedType.GetConstructor(AllInstance, null, Type.EmptyTypes, null)!;
+                return Expression.Lambda<Func<PSMemberInfoCollection<T>>>(
+                    Expression.Convert(Expression.New(ctor), typeof(PSMemberInfoCollection<T>))).Compile();
+            }
+        }
+
+        private static class ExtendedMemberMatcher<T> where T : PSMemberInfo
+        {
+            internal static readonly Func<PSObject, object, string, PSMemberTypes, int, IEnumerable<T>>? Match = CompileMatcher();
+
+            private static Func<PSObject, object, string, PSMemberTypes, int, IEnumerable<T>>? CompileMatcher()
+            {
+                if (s_smaIntegratingCollectionGeneric is null || s_mshMemberMatchOptionsType is null)
+                {
+                    return null;
+                }
+
+                Type closedType = s_smaIntegratingCollectionGeneric.MakeGenericType(typeof(T));
+                ConstructorInfo? ctor = Array.Find(closedType.GetConstructors(AllInstance), c => c.GetParameters().Length == 2);
+                MethodInfo? matchMethod = closedType.GetMethod(
+                    "Match",
+                    AllInstance,
+                    null,
+                    new[] { typeof(string), typeof(PSMemberTypes), s_mshMemberMatchOptionsType },
+                    null);
+                if (ctor is null || matchMethod is null)
+                {
+                    return null;
+                }
+
+                ParameterInfo[] ctorParams = ctor.GetParameters();
+                ParameterExpression source = Expression.Parameter(typeof(PSObject), "source");
+                ParameterExpression collections = Expression.Parameter(typeof(object), "collections");
+                ParameterExpression name = Expression.Parameter(typeof(string), "name");
+                ParameterExpression memberTypes = Expression.Parameter(typeof(PSMemberTypes), "memberTypes");
+                ParameterExpression matchOptions = Expression.Parameter(typeof(int), "matchOptions");
+
+                NewExpression instance = Expression.New(
+                    ctor,
+                    source,
+                    Expression.Convert(collections, ctorParams[1].ParameterType));
+                MethodCallExpression call = Expression.Call(
+                    instance,
+                    matchMethod,
+                    name,
+                    memberTypes,
+                    Expression.Convert(matchOptions, s_mshMemberMatchOptionsType));
+                return Expression.Lambda<Func<PSObject, object, string, PSMemberTypes, int, IEnumerable<T>>>(
+                    Expression.Convert(call, typeof(IEnumerable<T>)),
+                    source,
+                    collections,
+                    name,
+                    memberTypes,
+                    matchOptions).Compile();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool IsSmaConsolidatedString(Collection<string> col) =>
+            s_smaConsolidatedStringType is not null && s_smaConsolidatedStringType.IsInstanceOfType(col);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static AdapterProxy GetInternalAdapter(PSObject pso)
+            => new AdapterProxy(s_getInternalAdapter is not null ? s_getInternalAdapter(pso) : null);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static Collection<string>? InvokeAdapterBaseGetTypeNameHierarchy(object adapter, object baseObject) =>
+            s_adapterBaseGetTypeNameHierarchy is not null ? s_adapterBaseGetTypeNameHierarchy(adapter, baseObject) : null;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool GetImmediateBaseObjectIsEmpty(PSObject pso) =>
+            s_getImmediateBaseObjectIsEmpty is not null
+                ? s_getImmediateBaseObjectIsEmpty(pso)
+                : pso.ImmediateBaseObject is PSCustomObject;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static PSMemberInfoCollection<PSMemberInfo>? TryGetNonEmptyInstanceMembers(PSObject pso) =>
+            s_tryGetNonEmptyInstanceMembers is not null
+                ? s_tryGetNonEmptyInstanceMembers(pso)
+                : (GetInstanceMembers(pso) is { Count: > 0 } members ? members : null);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool HasInstanceMembers(PSObject pso) =>
+            TryGetNonEmptyInstanceMembers(pso) is not null;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool HasInstanceTypeName(PSObject pso) =>
+            s_hasInstanceTypeNameCheck is not null && s_hasInstanceTypeNameCheck(pso);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool HasTypeTableMembers(PSObject pso, TypeTable? typeTable) =>
+            s_hasTypeTableMembersCheck is null || s_hasTypeTableMembersCheck(pso, typeTable);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static ConsolidatedString GetInternalTypeNames(PSObject pso)
+        {
+            if (s_getInternalTypeNames is not null)
+            {
+                Collection<string>? smaTypeNames = s_getInternalTypeNames(pso);
+                if (smaTypeNames is not null)
+                {
+                    return s_typeNamesCache.GetValue(smaTypeNames, static tn => new ConsolidatedString(tn));
+                }
+            }
+
+            return new ConsolidatedString(pso.TypeNames);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void SetInternalTypeNames(PSObject pso, ConsolidatedString? value)
+        {
+            if (value is null)
+            {
+                pso.TypeNames.Clear();
+                return;
+            }
+
+            if (s_setInternalTypeNames is not null && s_createSmaConsolidatedString is not null)
+            {
+                Collection<string> smaInstance = value.SmaInstance ??= s_createSmaConsolidatedString(value);
+                s_setInternalTypeNames(pso, smaInstance);
+                return;
+            }
+
+            pso.TypeNames.Clear();
+            foreach (string t in value)
+            {
+                pso.TypeNames.Add(t);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static string? GetToStringFromDeserialization(PSObject pso) =>
+            s_getToStringFromDeserialization is not null ? s_getToStringFromDeserialization(pso) : null;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void SetToStringFromDeserialization(PSObject pso, string? value) =>
+            s_setToStringFromDeserialization?.Invoke(pso, value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static string? GetTokenText(PSObject pso) =>
+            s_getTokenText is not null ? s_getTokenText(pso) : null;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void SetTokenText(PSObject pso, string? value) =>
+            s_setTokenText?.Invoke(pso, value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool GetIsDeserialized(PSObject pso) =>
+            s_getIsDeserialized is not null && s_getIsDeserialized(pso);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void SetIsDeserialized(PSObject pso, bool value) =>
+            s_setIsDeserialized?.Invoke(pso, value);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void SetCoreOnDeserialization(PSObject pso, object? value, bool overrideTypeInfo) =>
+            s_setCoreOnDeserialization?.Invoke(pso, value, overrideTypeInfo);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void CopyDeserializerFields(PSObject source, PSObject target) =>
+            s_copyDeserializerFields?.Invoke(source, target);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static PSObject AsPSObjectWithPreserveToString(object obj, bool preserveToString) =>
+            s_asPSObjectPreserveToString is not null
+                ? s_asPSObjectPreserveToString(obj, preserveToString)
+                : PSObject.AsPSObject(obj);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static SerializationMethod GetSerializationMethod(PSObject pso, TypeTable? typeTable) =>
+            s_getSerializationMethod is not null
+                ? (SerializationMethod)s_getSerializationMethod(pso, typeTable)
+                : SerializationMethod.AllPublicProperties;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static int GetSerializationDepth(PSObject pso, TypeTable? typeTable) =>
+            s_getSerializationDepth is not null ? s_getSerializationDepth(pso, typeTable) : 0;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static PSPropertyInfo? GetStringSerializationSource(PSObject pso, TypeTable? typeTable) =>
+            s_getStringSerializationSource is not null ? s_getStringSerializationSource(pso, typeTable) : null;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool ShouldSerializeAdapter(PSObject pso) =>
+            s_shouldSerializeAdapter is null || s_shouldSerializeAdapter(pso);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static Type? GetTargetTypeForDeserialization(PSObject pso, TypeTable? typeTable) =>
+            s_getTargetTypeForDeserialization is not null ? s_getTargetTypeForDeserialization(pso, typeTable) : null;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static Collection<string> GetSpecificPropertiesToSerialize(PSObject pso, TypeTable? typeTable) =>
+            (s_getSpecificPropertiesToSerialize is not null ? s_getSpecificPropertiesToSerialize(pso, typeTable) : null)
+            ?? new Collection<string>();
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static PSMemberInfoCollection<T> CreateSmaInternalMemberCollection<T>() where T : PSMemberInfo =>
+            InternalCollectionFactory<T>.Create();
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static PSMemberInfoInternalCollection<PSPropertyInfo>? GetAdaptedProperties(PSObject pso)
         {
-            MethodInfo? m = typeof(PSObject).GetMethod("GetAdaptedProperties", AllInstance);
-            object? adapted = m is not null ? m.Invoke(pso, Array.Empty<object>()) : s_psoAdaptedMembers?.GetValue(pso);
+            PSMemberInfoCollection<PSPropertyInfo>? adapted = s_getAdaptedProperties is not null
+                ? s_getAdaptedProperties(pso)
+                : (s_getAdaptedMembers is not null ? s_getAdaptedMembers(pso) : null);
             return adapted is not null ? new PSMemberInfoInternalCollection<PSPropertyInfo>(adapted) : null;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static PSMemberInfoInternalCollection<PSPropertyInfo>? GetAdaptedMembers(PSObject pso)
         {
-            object? adapted = s_psoAdaptedMembers?.GetValue(pso);
+            PSMemberInfoCollection<PSPropertyInfo>? adapted = s_getAdaptedMembers is not null ? s_getAdaptedMembers(pso) : null;
             return adapted is not null ? new PSMemberInfoInternalCollection<PSPropertyInfo>(adapted) : null;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static void SetAdaptedMembers(PSObject pso, PSMemberInfoInternalCollection<PSPropertyInfo>? value)
         {
-            object? backing = CreateSmaInternalPropertyCollection();
-            s_psoAdaptedMembers?.SetValue(pso, backing);
+            s_setAdaptedMembers?.Invoke(pso, value?.InnerCollection ?? CreateSmaInternalMemberCollection<PSPropertyInfo>());
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static PSMemberInfoInternalCollection<PSPropertyInfo>? GetClrMembers(PSObject pso)
         {
-            object? clr = s_psoClrMembers?.GetValue(pso);
+            PSMemberInfoCollection<PSPropertyInfo>? clr = s_getClrMembers is not null ? s_getClrMembers(pso) : null;
             return clr is not null ? new PSMemberInfoInternalCollection<PSPropertyInfo>(clr) : null;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static void SetClrMembers(PSObject pso, PSMemberInfoInternalCollection<PSPropertyInfo>? value)
         {
-            object? backing = CreateSmaInternalPropertyCollection();
-            s_psoClrMembers?.SetValue(pso, backing);
+            s_setClrMembers?.Invoke(pso, value?.InnerCollection ?? CreateSmaInternalMemberCollection<PSPropertyInfo>());
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static PSMemberInfoCollection<PSMemberInfo> GetInstanceMembers(PSObject pso)
         {
-            if (s_psoInstanceMembers?.GetValue(pso) is PSMemberInfoCollection<PSMemberInfo> instanceMembers)
+            if (s_getInstanceMembers is not null && s_getInstanceMembers(pso) is PSMemberInfoCollection<PSMemberInfo> instanceMembers)
             {
                 return instanceMembers;
             }
@@ -849,81 +1482,87 @@ namespace System.Management.Automation
             return pso.Members;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static PSProperty CreateDeserializedPSProperty(string name, object? serializedValue)
         {
-            if (s_psPropertyCtor is not null)
+            if (s_createPsProperty is not null)
             {
-                return (PSProperty)s_psPropertyCtor.Invoke(new object?[] { name, serializedValue });
+                return s_createPsProperty(name, serializedValue);
             }
 
             throw new NotSupportedException("PSProperty(string, object) constructor not found.");
         }
 
-        internal static bool GetMemberShouldSerialize(PSMemberInfo member)
-        {
-            if (s_memberShouldSerialize is not null && s_memberShouldSerialize.GetValue(member) is bool b)
-            {
-                return b;
-            }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool GetMemberShouldSerialize(PSMemberInfo member) =>
+            s_getMemberShouldSerialize is null || s_getMemberShouldSerialize(member);
 
-            return true;
-        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static PSMemberInfo? GetAliasReferencedMember(PSAliasProperty alias) =>
+            s_getAliasReferencedMember is not null ? s_getAliasReferencedMember(alias) : null;
 
-        internal static PSMemberInfo? GetAliasReferencedMember(PSAliasProperty alias)
-            => s_aliasReferencedMember?.GetValue(alias) as PSMemberInfo;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void SetHasInstanceMember(string memberName) =>
+            s_setHasInstanceMember?.Invoke(memberName);
 
-        internal static void SetHasInstanceMember(string memberName)
-            => s_setHasInstanceMember?.Invoke(null, new object[] { memberName });
-
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static object? ConvertTo(object? valueToConvert, Type resultType, bool recursion, IFormatProvider formatProvider, TypeTable? backupTypeTable)
         {
             if (s_convertTo5 is not null)
             {
-                try
-                {
-                    return s_convertTo5.Invoke(null, new object?[] { valueToConvert, resultType, recursion, formatProvider, backupTypeTable });
-                }
-                catch (TargetInvocationException tie) when (tie.InnerException is not null)
-                {
-                    throw tie.InnerException;
-                }
+                return s_convertTo5(valueToConvert, resultType, recursion, formatProvider, backupTypeTable);
             }
 
             return LanguagePrimitives.ConvertTo(valueToConvert, resultType, formatProvider);
         }
 
-        internal static string EncryptSecureString(PSRemotingCryptoHelper helper, SecureString ss)
-        {
-            if (s_cryptoEncrypt is not null)
-            {
-                return (string)s_cryptoEncrypt.Invoke(helper, new object[] { ss })!;
-            }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static string EncryptSecureString(PSRemotingCryptoHelper helper, SecureString ss) =>
+            s_cryptoEncrypt is not null
+                ? s_cryptoEncrypt(helper, ss)
+                : Microsoft.PowerShell.SecureStringHelper.Protect(ss);
 
-            return Microsoft.PowerShell.SecureStringHelper.Protect(ss);
-        }
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static SecureString DecryptSecureString(PSRemotingCryptoHelper helper, string encrypted) =>
+            s_cryptoDecrypt is not null
+                ? s_cryptoDecrypt(helper, encrypted)
+                : Microsoft.PowerShell.SecureStringHelper.Unprotect(encrypted);
 
-        internal static SecureString DecryptSecureString(PSRemotingCryptoHelper helper, string encrypted)
-        {
-            if (s_cryptoDecrypt is not null)
-            {
-                return (SecureString)s_cryptoDecrypt.Invoke(helper, new object[] { encrypted })!;
-            }
-
-            return Microsoft.PowerShell.SecureStringHelper.Unprotect(encrypted);
-        }
-
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static Collection<CollectionEntry<PSMemberInfo>> GetMemberCollection(PSMemberViewTypes viewType, TypeTable? backupTypeTable)
         {
-            object? smaCol = s_psoGetMemberCollection?.Invoke(null, new object?[] { viewType, backupTypeTable });
+            if (backupTypeTable is null && viewType == PSMemberViewTypes.Extended)
+            {
+                return s_defaultExtendedMemberCollection;
+            }
+
+            return CreateMemberCollectionCore(viewType, backupTypeTable);
+        }
+
+        private static Collection<CollectionEntry<PSMemberInfo>> CreateMemberCollectionCore(PSMemberViewTypes viewType, TypeTable? backupTypeTable)
+        {
+            object? smaCol = s_psoGetMemberCollection is not null ? s_psoGetMemberCollection(viewType, backupTypeTable) : null;
             return new Collection<CollectionEntry<PSMemberInfo>> { new CollectionEntry<PSMemberInfo>(smaCol) };
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static Collection<CollectionEntry<PSPropertyInfo>> GetPropertyCollection(PSMemberViewTypes viewType, TypeTable? backupTypeTable)
         {
-            object? smaCol = s_psoGetPropertyCollection?.Invoke(null, new object?[] { viewType, backupTypeTable });
+            if (backupTypeTable is null && viewType == (PSMemberViewTypes.Extended | PSMemberViewTypes.Adapted | PSMemberViewTypes.Base))
+            {
+                return s_defaultAllPropertyCollection;
+            }
+
+            return CreatePropertyCollectionCore(viewType, backupTypeTable);
+        }
+
+        private static Collection<CollectionEntry<PSPropertyInfo>> CreatePropertyCollectionCore(PSMemberViewTypes viewType, TypeTable? backupTypeTable)
+        {
+            object? smaCol = s_psoGetPropertyCollection is not null ? s_psoGetPropertyCollection(viewType, backupTypeTable) : null;
             return new Collection<CollectionEntry<PSPropertyInfo>> { new CollectionEntry<PSPropertyInfo>(smaCol) };
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static PSMemberInfoInternalCollection<PSPropertyInfo>? GetSpecificPropertiesToSerializeFromSma(
             PSObject source,
             Collection<CollectionEntry<PSPropertyInfo>>? allPropertiesCollection,
@@ -932,39 +1571,21 @@ namespace System.Management.Automation
             object? smaPropsCol = allPropertiesCollection is { Count: > 0 } ? allPropertiesCollection[0].SmaCollection : null;
             if (s_smaGetSpecificPropertiesToSerialize is not null && smaPropsCol is not null)
             {
-                object? res = s_smaGetSpecificPropertiesToSerialize.Invoke(null, new object?[] { source, smaPropsCol, typeTable });
+                PSMemberInfoCollection<PSPropertyInfo>? res = s_smaGetSpecificPropertiesToSerialize(source, smaPropsCol, typeTable);
                 return res is not null ? new PSMemberInfoInternalCollection<PSPropertyInfo>(res) : null;
             }
 
             return null;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static IEnumerable<T> MatchExtendedMembers<T>(PSObject source, object? smaCollections, string name, PSMemberTypes memberTypes, int matchOptions)
             where T : PSMemberInfo
         {
-            if (s_smaIntegratingCollectionGeneric is not null && smaCollections is not null && s_mshMemberMatchOptionsType is not null)
+            Func<PSObject, object, string, PSMemberTypes, int, IEnumerable<T>>? matcher = ExtendedMemberMatcher<T>.Match;
+            if (matcher is not null && smaCollections is not null)
             {
-                Type closedType = s_smaIntegratingCollectionGeneric.MakeGenericType(typeof(T));
-                object? integrating = Activator.CreateInstance(
-                    closedType,
-                    AllInstance,
-                    null,
-                    new object?[] { source, smaCollections },
-                    null);
-                MethodInfo? matchMethod = closedType.GetMethod(
-                    "Match",
-                    AllInstance,
-                    null,
-                    new[] { typeof(string), typeof(PSMemberTypes), s_mshMemberMatchOptionsType },
-                    null);
-                if (integrating is not null && matchMethod is not null)
-                {
-                    object matchOptionsEnum = Enum.ToObject(s_mshMemberMatchOptionsType, matchOptions);
-                    if (matchMethod.Invoke(integrating, new object[] { name, memberTypes, matchOptionsEnum }) is IEnumerable<T> matched)
-                    {
-                        return matched;
-                    }
-                }
+                return matcher(source, smaCollections, name, memberTypes, matchOptions);
             }
 
             var list = new List<T>();
@@ -980,31 +1601,16 @@ namespace System.Management.Automation
             return new ReadOnlyCollection<T>(list);
         }
 
-        internal static ReadOnlyPSMemberInfoCollection<T> CreateReadOnlyCollection<T>(PSMemberInfoInternalCollection<T> members)
-            where T : PSMemberInfo
-        {
-            ConstructorInfo? ctor = typeof(ReadOnlyPSMemberInfoCollection<T>).GetConstructors(AllInstance)[0];
-            return (ReadOnlyPSMemberInfoCollection<T>)ctor.Invoke(new object?[] { null });
-        }
+        internal static void ErrorRecordToPSObjectForRemoting(ErrorRecord errorRecord, PSObject dest) =>
+            s_errorRecordToPSObjectForRemoting?.Invoke(errorRecord, dest);
 
-        internal static void ErrorRecordToPSObjectForRemoting(ErrorRecord errorRecord, PSObject dest)
-            => s_errorRecordToPSObjectForRemoting?.Invoke(errorRecord, new object[] { dest });
+        internal static void InformationalRecordToPSObjectForRemoting(InformationalRecord record, PSObject dest) =>
+            s_informationalRecordToPSObjectForRemoting?.Invoke(record, dest);
 
-        internal static void InformationalRecordToPSObjectForRemoting(InformationalRecord record, PSObject dest)
-            => s_informationalRecordToPSObjectForRemoting?.Invoke(record, new object[] { dest });
-
-        internal static ScriptBlock CreateScriptBlock(string scriptText, bool isProductCode)
-        {
-            if (s_scriptBlockCreateDelayParsed is not null)
-            {
-                if (s_scriptBlockCreateDelayParsed.Invoke(null, new object[] { scriptText, isProductCode }) is ScriptBlock sb)
-                {
-                    return sb;
-                }
-            }
-
-            return ScriptBlock.Create(scriptText);
-        }
+        internal static ScriptBlock CreateScriptBlock(string scriptText, bool isProductCode) =>
+            s_scriptBlockCreateDelayParsed is not null
+                ? s_scriptBlockCreateDelayParsed(scriptText, isProductCode)
+                : ScriptBlock.Create(scriptText);
     }
 
     internal static class StandaloneSerializationExtensions
@@ -1033,18 +1639,8 @@ namespace System.Management.Automation
 
             internal ConsolidatedString InternalTypeNames
             {
-                get => new ConsolidatedString(pso.TypeNames);
-                set
-                {
-                    pso.TypeNames.Clear();
-                    if (value is not null)
-                    {
-                        foreach (string t in value)
-                        {
-                            pso.TypeNames.Add(t);
-                        }
-                    }
-                }
+                get => SmaInternalBridge.GetInternalTypeNames(pso);
+                set => SmaInternalBridge.SetInternalTypeNames(pso, value);
             }
 
             internal AdapterProxy InternalAdapter => SmaInternalBridge.GetInternalAdapter(pso);
@@ -1339,7 +1935,7 @@ namespace System.Management.Automation
             Collection<CollectionEntry<PSPropertyInfo>>? allPropertiesCollection,
             TypeTable? typeTable)
         {
-            if (source is null)
+            if (source is null || source.GetSerializationMethod(typeTable) != SerializationMethod.SpecificProperties)
             {
                 return null;
             }
@@ -1351,23 +1947,18 @@ namespace System.Management.Automation
                 return fromSma;
             }
 
-            if (source.GetSerializationMethod(typeTable) == SerializationMethod.SpecificProperties)
+            var specificProperties = new PSMemberInfoInternalCollection<PSPropertyInfo>();
+            Collection<string> namesOfPropertiesToSerialize = source.GetSpecificPropertiesToSerialize(typeTable);
+            foreach (string propertyName in namesOfPropertiesToSerialize)
             {
-                var specificProperties = new PSMemberInfoInternalCollection<PSPropertyInfo>();
-                Collection<string> namesOfPropertiesToSerialize = source.GetSpecificPropertiesToSerialize(typeTable);
-                foreach (string propertyName in namesOfPropertiesToSerialize)
+                PSPropertyInfo? property = source.Properties[propertyName];
+                if (property is not null)
                 {
-                    PSPropertyInfo? property = source.Properties[propertyName];
-                    if (property is not null)
-                    {
-                        specificProperties.Add(property);
-                    }
+                    specificProperties.Add(property);
                 }
-
-                return specificProperties;
             }
 
-            return null;
+            return specificProperties;
         }
 
         internal static object? GetPropertyValueInThreadSafeManner(
@@ -1429,16 +2020,26 @@ namespace Microsoft.PowerShell
     {
         private static readonly Type? s_helperType =
             typeof(PSObject).Assembly.GetType("Microsoft.PowerShell.SecureStringHelper");
-        private static readonly MethodInfo? s_protect =
-            s_helperType?.GetMethod("Protect", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
-        private static readonly MethodInfo? s_unprotect =
-            s_helperType?.GetMethod("Unprotect", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly Func<SecureString, string>? s_protect = CompileProtect();
+        private static readonly Func<string, SecureString>? s_unprotect = CompileUnprotect();
+
+        private static Func<SecureString, string>? CompileProtect()
+        {
+            MethodInfo? m = s_helperType?.GetMethod("Protect", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            return m is not null ? (Func<SecureString, string>)Delegate.CreateDelegate(typeof(Func<SecureString, string>), m) : null;
+        }
+
+        private static Func<string, SecureString>? CompileUnprotect()
+        {
+            MethodInfo? m = s_helperType?.GetMethod("Unprotect", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            return m is not null ? (Func<string, SecureString>)Delegate.CreateDelegate(typeof(Func<string, SecureString>), m) : null;
+        }
 
         internal static string Protect(SecureString input)
         {
             if (s_protect is not null)
             {
-                return (string)s_protect.Invoke(null, new object[] { input })!;
+                return s_protect(input);
             }
 
             throw new PlatformNotSupportedException("SecureStringHelper.Protect unavailable.");
@@ -1448,7 +2049,7 @@ namespace Microsoft.PowerShell
         {
             if (s_unprotect is not null)
             {
-                return (SecureString)s_unprotect.Invoke(null, new object[] { input })!;
+                return s_unprotect(input);
             }
 
             throw new PlatformNotSupportedException("SecureStringHelper.Unprotect unavailable.");

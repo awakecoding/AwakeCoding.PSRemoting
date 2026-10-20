@@ -48,9 +48,9 @@ namespace System.Management.Automation
         /// <returns>The serialized object as a CBOR byte array.</returns>
         public static byte[] Serialize(object source, int depth)
         {
-            using MemoryStream ms = new();
-            Serialize(source, ms, depth);
-            return ms.ToArray();
+            return InternalCborSerializer.SerializeToBytes(
+                source,
+                new SerializationContext(depth, useDepthFromTypes: true));
         }
 
         /// <summary>
@@ -157,8 +157,15 @@ namespace System.Management.Automation
                 throw PSTraceSource.NewArgumentNullException(nameof(source));
             }
 
-            using MemoryStream ms = new(source, writable: false);
-            return DeserializeAsList(ms);
+            List<object> results = new();
+            CborDeserializer deserializer = new(new ReadOnlyMemory<byte>(source));
+            while (!deserializer.Done())
+            {
+                object result = deserializer.Deserialize();
+                results.Add(result);
+            }
+
+            return results.ToArray();
         }
 
         /// <summary>
@@ -326,6 +333,22 @@ namespace System.Management.Automation
             _deserializer.Start();
         }
 
+        internal CborDeserializer(ReadOnlyMemory<byte> memory)
+            : this(memory, new DeserializationContext())
+        {
+        }
+
+        internal CborDeserializer(ReadOnlyMemory<byte> memory, DeserializationContext context)
+        {
+            if (context is null)
+            {
+                throw PSTraceSource.NewArgumentNullException(nameof(context));
+            }
+
+            _deserializer = new InternalCborDeserializer(new CborStreamReader(memory), context);
+            _deserializer.Start();
+        }
+
         internal TypeTable TypeTable
         {
             get => _deserializer.TypeTable;
@@ -365,6 +388,9 @@ namespace System.Management.Automation
     {
         private const int MaxDepthBelowTopLevel = 50;
 
+        [ThreadStatic]
+        private static CborStreamWriter s_threadStaticBufferWriter;
+
         private readonly CborStreamWriter _writer;
         private readonly SerializationContext _context;
         private readonly ReferenceIdHandlerForSerializer<object> _objectRefIdHandler;
@@ -376,6 +402,60 @@ namespace System.Management.Automation
         private bool? _canUseDefaultRunspaceInThreadSafeManner;
         private Collection<CollectionEntry<PSMemberInfo>> _extendedMembersCollection;
         private Collection<CollectionEntry<PSPropertyInfo>> _allPropertiesCollection;
+
+        internal static byte[] SerializeToBytes(object source, SerializationContext context, string streamName = null)
+        {
+            CborStreamWriter writer = s_threadStaticBufferWriter;
+            if (writer is not null)
+            {
+                s_threadStaticBufferWriter = null;
+                writer.Reset();
+            }
+            else
+            {
+                writer = new CborStreamWriter(initialCapacity: 1024);
+            }
+
+            try
+            {
+                InternalCborSerializer serializer = new(writer, context);
+                serializer.Start();
+                serializer.WriteOneTopLevelObject(source, streamName);
+                serializer.End();
+                return writer.ToByteArray();
+            }
+            finally
+            {
+                s_threadStaticBufferWriter = writer;
+            }
+        }
+
+        internal static Google.Protobuf.ByteString SerializeToByteString(object source, SerializationContext context, string streamName = null)
+        {
+            CborStreamWriter writer = s_threadStaticBufferWriter;
+            if (writer is not null)
+            {
+                s_threadStaticBufferWriter = null;
+                writer.Reset();
+            }
+            else
+            {
+                writer = new CborStreamWriter(initialCapacity: 1024);
+            }
+
+            try
+            {
+                InternalCborSerializer serializer = new(writer, context);
+                serializer.Start();
+                serializer.WriteOneTopLevelObject(source, streamName);
+                serializer.End();
+                return Google.Protobuf.ByteString.CopyFrom(writer.WrittenSpan);
+            }
+            finally
+            {
+                s_threadStaticBufferWriter = writer;
+            }
+        }
 
         internal InternalCborSerializer(CborStreamWriter writer, SerializationContext context)
         {
@@ -479,8 +559,6 @@ namespace System.Management.Automation
                     return;
                 }
 
-                depth = GetDepthOfSerialization(source, depth);
-
                 if (HandlePrimitiveKnownTypeByConvertingToPSObject(source, streamName, depth))
                 {
                     return;
@@ -497,6 +575,8 @@ namespace System.Management.Automation
                 {
                     return;
                 }
+
+                depth = GetDepthOfSerialization(source, depth);
 
                 if (HandleKnownContainerTypes(source, streamName, depth))
                 {
@@ -520,10 +600,17 @@ namespace System.Management.Automation
 
         private bool HandlePrimitiveKnownTypeByConvertingToPSObject(object source, string streamName, int depth)
         {
-            if (IsKnownCborPrimitive(source.GetType()))
+            if (source is not PSObject && IsKnownCborPrimitive(source.GetType()))
             {
+                if (streamName is null)
+                {
+                    WriteOnePrimitiveKnownType(source);
+                    return true;
+                }
+
                 PSObject pktInfoPSObject = PSObject.AsPSObject(source);
-                return HandlePrimitiveKnownTypePSObject(pktInfoPSObject, streamName, depth);
+                WritePrimitiveTypePSObject(pktInfoPSObject, source, streamName, depth);
+                return true;
             }
 
             return false;
@@ -558,6 +645,7 @@ namespace System.Management.Automation
 
             if (hasNotes || hasModifiedTypesCollection || hasModifiedToString || streamName is not null)
             {
+                depth = GetDepthOfSerialization(source, depth);
                 string refId = _objectRefIdHandler.SetRefId(source);
                 _writer.WriteTag(CborTags.PSObject);
                 _writer.WriteStartIndefiniteMap();
@@ -1070,7 +1158,7 @@ namespace System.Management.Automation
 
         private void SerializeInstanceProperties(PSObject source, int depth)
         {
-            PSMemberInfoCollection<PSMemberInfo> instanceMembers = source.InstanceMembers;
+            PSMemberInfoCollection<PSMemberInfo> instanceMembers = SmaInternalBridge.TryGetNonEmptyInstanceMembers(source);
             if (instanceMembers is not null)
             {
                 WriteMemberInfoCollection(instanceMembers, depth, writeEnclosingKey: true);
@@ -1085,6 +1173,17 @@ namespace System.Management.Automation
             IEnumerable<PSMemberInfo> extendedMembersEnumerable;
             if (specificPropertiesToSerialize is null)
             {
+                if (!SmaInternalBridge.HasTypeTableMembers(source, _typeTable))
+                {
+                    PSMemberInfoCollection<PSMemberInfo> instanceMembers = SmaInternalBridge.TryGetNonEmptyInstanceMembers(source);
+                    if (instanceMembers is not null)
+                    {
+                        WriteMemberInfoCollection(instanceMembers, depth, writeEnclosingKey: true);
+                    }
+
+                    return;
+                }
+
                 PSMemberInfoIntegratingCollection<PSMemberInfo> membersToSearch =
                     new(source, ExtendedMembersCollection);
                 extendedMembersEnumerable = membersToSearch.Match(
@@ -1094,7 +1193,10 @@ namespace System.Management.Automation
             }
             else
             {
-                List<PSMemberInfo> extendedMembersList = new(source.InstanceMembers);
+                PSMemberInfoCollection<PSMemberInfo> instanceMembers = SmaInternalBridge.TryGetNonEmptyInstanceMembers(source);
+                List<PSMemberInfo> extendedMembersList = instanceMembers is not null
+                    ? new(instanceMembers)
+                    : new();
                 extendedMembersEnumerable = extendedMembersList;
 
                 foreach (PSMemberInfo member in specificPropertiesToSerialize)
@@ -1312,6 +1414,11 @@ namespace System.Management.Automation
 
         private static bool PSObjectHasModifiedTypesCollection(PSObject pso)
         {
+            if (!SmaInternalBridge.HasInstanceTypeName(pso))
+            {
+                return false;
+            }
+
             ConsolidatedString currentTypes = pso.InternalTypeNames;
             Collection<string> originalTypes = pso.InternalAdapter.BaseGetTypeNameHierarchy(pso.ImmediateBaseObject);
 
@@ -1335,7 +1442,7 @@ namespace System.Management.Automation
 
         private static bool PSObjectHasNotes(PSObject source)
         {
-            return source.InstanceMembers is not null && source.InstanceMembers.Count > 0;
+            return SmaInternalBridge.HasInstanceMembers(source);
         }
     }
 
@@ -2234,18 +2341,84 @@ namespace System.Management.Automation
     }
 
     /// <summary>
-    /// Streaming RFC 8949 CBOR writer over a <see cref="Stream"/>.
+    /// Streaming RFC 8949 CBOR writer over a <see cref="Stream"/> or internal buffer.
     /// </summary>
     internal sealed class CborStreamWriter
     {
         private readonly Stream _stream;
+        private byte[] _buffer;
+        private int _pos;
 
         internal CborStreamWriter(Stream stream)
         {
             _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         }
 
-        internal void Flush() => _stream.Flush();
+        internal CborStreamWriter(int initialCapacity = 1024)
+        {
+            _buffer = new byte[Math.Max(initialCapacity, 64)];
+        }
+
+        internal void Reset()
+        {
+            _pos = 0;
+            if (_buffer is not null && _buffer.Length > 262144)
+            {
+                _buffer = new byte[4096];
+            }
+        }
+
+        internal ReadOnlySpan<byte> WrittenSpan => _buffer.AsSpan(0, _pos);
+
+        internal byte[] ToByteArray()
+        {
+            byte[] result = new byte[_pos];
+            Buffer.BlockCopy(_buffer, 0, result, 0, _pos);
+            return result;
+        }
+
+        private void EnsureCapacity(int additional)
+        {
+            int required = _pos + additional;
+            if (required <= _buffer.Length)
+            {
+                return;
+            }
+
+            int newSize = Math.Max(_buffer.Length * 2, required);
+            byte[] next = new byte[newSize];
+            Buffer.BlockCopy(_buffer, 0, next, 0, _pos);
+            _buffer = next;
+        }
+
+        private void WriteRawByte(byte b)
+        {
+            if (_stream is not null)
+            {
+                _stream.WriteByte(b);
+            }
+            else
+            {
+                EnsureCapacity(1);
+                _buffer[_pos++] = b;
+            }
+        }
+
+        private void WriteRawBytes(ReadOnlySpan<byte> bytes)
+        {
+            if (_stream is not null)
+            {
+                _stream.Write(bytes);
+            }
+            else
+            {
+                EnsureCapacity(bytes.Length);
+                bytes.CopyTo(_buffer.AsSpan(_pos));
+                _pos += bytes.Length;
+            }
+        }
+
+        internal void Flush() => _stream?.Flush();
 
         internal void WriteUInt64(ulong value) => WriteTypeAndArgument(0, value);
 
@@ -2264,7 +2437,7 @@ namespace System.Management.Automation
         internal void WriteByteString(ReadOnlySpan<byte> bytes)
         {
             WriteTypeAndArgument(2, (ulong)bytes.Length);
-            _stream.Write(bytes);
+            WriteRawBytes(bytes);
         }
 
         internal void WriteTextString(string text)
@@ -2275,46 +2448,129 @@ namespace System.Management.Automation
                 return;
             }
 
-            byte[] utf8 = Encoding.UTF8.GetBytes(text);
-            WriteTypeAndArgument(3, (ulong)utf8.Length);
-            _stream.Write(utf8, 0, utf8.Length);
+            if (text.Length == 0)
+            {
+                WriteRawByte(0x60);
+                return;
+            }
+
+            if (_stream is null)
+            {
+                int byteCount = Encoding.UTF8.GetByteCount(text);
+                WriteTypeAndArgument(3, (ulong)byteCount);
+                EnsureCapacity(byteCount);
+                int written = Encoding.UTF8.GetBytes(text.AsSpan(), _buffer.AsSpan(_pos, byteCount));
+                _pos += written;
+            }
+            else if (text.Length <= 85)
+            {
+                Span<byte> utf8 = stackalloc byte[256];
+                int written = Encoding.UTF8.GetBytes(text.AsSpan(), utf8);
+                WriteTypeAndArgument(3, (ulong)written);
+                _stream.Write(utf8.Slice(0, written));
+            }
+            else
+            {
+                byte[] utf8 = Encoding.UTF8.GetBytes(text);
+                WriteTypeAndArgument(3, (ulong)utf8.Length);
+                _stream.Write(utf8, 0, utf8.Length);
+            }
         }
 
         internal void WriteStartArray(int count) => WriteTypeAndArgument(4, (ulong)count);
 
-        internal void WriteStartIndefiniteArray() => _stream.WriteByte(0x9f);
+        internal void WriteStartIndefiniteArray() => WriteRawByte(0x9f);
 
         internal void WriteStartMap(int count) => WriteTypeAndArgument(5, (ulong)count);
 
-        internal void WriteStartIndefiniteMap() => _stream.WriteByte(0xbf);
+        internal void WriteStartIndefiniteMap() => WriteRawByte(0xbf);
 
-        internal void WriteEndIndefinite() => _stream.WriteByte(0xff);
+        internal void WriteEndIndefinite() => WriteRawByte(0xff);
 
         internal void WriteTag(ulong tag) => WriteTypeAndArgument(6, tag);
 
-        internal void WriteBoolean(bool value) => _stream.WriteByte(value ? (byte)0xf5 : (byte)0xf4);
+        internal void WriteBoolean(bool value) => WriteRawByte(value ? (byte)0xf5 : (byte)0xf4);
 
-        internal void WriteNull() => _stream.WriteByte(0xf6);
+        internal void WriteNull() => WriteRawByte(0xf6);
 
         internal void WriteSingle(float value)
         {
-            Span<byte> buf = stackalloc byte[5];
-            buf[0] = 0xfa;
-            BinaryPrimitives.WriteSingleBigEndian(buf.Slice(1), value);
-            _stream.Write(buf);
+            if (_stream is null)
+            {
+                EnsureCapacity(5);
+                _buffer[_pos] = 0xfa;
+                BinaryPrimitives.WriteSingleBigEndian(_buffer.AsSpan(_pos + 1, 4), value);
+                _pos += 5;
+            }
+            else
+            {
+                Span<byte> buf = stackalloc byte[5];
+                buf[0] = 0xfa;
+                BinaryPrimitives.WriteSingleBigEndian(buf.Slice(1), value);
+                _stream.Write(buf);
+            }
         }
 
         internal void WriteDouble(double value)
         {
-            Span<byte> buf = stackalloc byte[9];
-            buf[0] = 0xfb;
-            BinaryPrimitives.WriteDoubleBigEndian(buf.Slice(1), value);
-            _stream.Write(buf);
+            if (_stream is null)
+            {
+                EnsureCapacity(9);
+                _buffer[_pos] = 0xfb;
+                BinaryPrimitives.WriteDoubleBigEndian(_buffer.AsSpan(_pos + 1, 8), value);
+                _pos += 9;
+            }
+            else
+            {
+                Span<byte> buf = stackalloc byte[9];
+                buf[0] = 0xfb;
+                BinaryPrimitives.WriteDoubleBigEndian(buf.Slice(1), value);
+                _stream.Write(buf);
+            }
         }
 
         private void WriteTypeAndArgument(int majorType, ulong argument)
         {
             byte prefix = (byte)(majorType << 5);
+            if (_stream is null)
+            {
+                if (argument < 24)
+                {
+                    EnsureCapacity(1);
+                    _buffer[_pos++] = (byte)(prefix | (byte)argument);
+                }
+                else if (argument <= byte.MaxValue)
+                {
+                    EnsureCapacity(2);
+                    _buffer[_pos] = (byte)(prefix | 24);
+                    _buffer[_pos + 1] = (byte)argument;
+                    _pos += 2;
+                }
+                else if (argument <= ushort.MaxValue)
+                {
+                    EnsureCapacity(3);
+                    _buffer[_pos] = (byte)(prefix | 25);
+                    BinaryPrimitives.WriteUInt16BigEndian(_buffer.AsSpan(_pos + 1, 2), (ushort)argument);
+                    _pos += 3;
+                }
+                else if (argument <= uint.MaxValue)
+                {
+                    EnsureCapacity(5);
+                    _buffer[_pos] = (byte)(prefix | 26);
+                    BinaryPrimitives.WriteUInt32BigEndian(_buffer.AsSpan(_pos + 1, 4), (uint)argument);
+                    _pos += 5;
+                }
+                else
+                {
+                    EnsureCapacity(9);
+                    _buffer[_pos] = (byte)(prefix | 27);
+                    BinaryPrimitives.WriteUInt64BigEndian(_buffer.AsSpan(_pos + 1, 8), argument);
+                    _pos += 9;
+                }
+
+                return;
+            }
+
             if (argument < 24)
             {
                 _stream.WriteByte((byte)(prefix | (byte)argument));
@@ -2351,11 +2607,14 @@ namespace System.Management.Automation
     }
 
     /// <summary>
-    /// Streaming RFC 8949 CBOR reader over a <see cref="Stream"/>.
+    /// Streaming RFC 8949 CBOR reader over a <see cref="Stream"/> or <see cref="ReadOnlyMemory{T}"/>.
     /// </summary>
     internal sealed class CborStreamReader
     {
         private readonly Stream _stream;
+        private readonly ReadOnlyMemory<byte> _memory;
+        private readonly bool _useMemory;
+        private int _pos;
         private int _peekedByte = -1;
 
         internal CborStreamReader(Stream stream)
@@ -2363,8 +2622,19 @@ namespace System.Management.Automation
             _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         }
 
+        internal CborStreamReader(ReadOnlyMemory<byte> memory)
+        {
+            _memory = memory;
+            _useMemory = true;
+        }
+
         internal bool IsEOF()
         {
+            if (_useMemory)
+            {
+                return _pos >= _memory.Length;
+            }
+
             if (_peekedByte >= 0)
             {
                 return false;
@@ -2385,7 +2655,15 @@ namespace System.Management.Automation
             int b = PeekByte();
             if (b == 0xff)
             {
-                _peekedByte = -1;
+                if (_useMemory)
+                {
+                    _pos++;
+                }
+                else
+                {
+                    _peekedByte = -1;
+                }
+
                 return true;
             }
 
@@ -2394,6 +2672,14 @@ namespace System.Management.Automation
 
         internal ulong PeekTag()
         {
+            if (_useMemory)
+            {
+                int savedPos = _pos;
+                ulong tag = ReadTag();
+                _pos = savedPos;
+                return tag;
+            }
+
             long pos = _stream.CanSeek ? _stream.Position : -1;
             int savedPeek = _peekedByte;
             if (pos >= 0)
@@ -2472,7 +2758,8 @@ namespace System.Management.Automation
             }
 
             ulong len = ReadArgument(additional);
-            byte[] buf = new byte[checked((int)len)];
+            int byteLen = checked((int)len);
+            byte[] buf = new byte[byteLen];
             ReadExact(buf);
             return buf;
         }
@@ -2504,9 +2791,78 @@ namespace System.Management.Automation
                 return string.Empty;
             }
 
-            byte[] buf = new byte[checked((int)len)];
+            int byteLen = checked((int)len);
+            if (_useMemory)
+            {
+                if (_pos + byteLen > _memory.Length)
+                {
+                    throw new EndOfStreamException("Unexpected end of CBOR stream.");
+                }
+
+                ReadOnlySpan<byte> slice = _memory.Span.Slice(_pos, byteLen);
+                _pos += byteLen;
+                return DecodeShortOrUtf8String(slice);
+            }
+
+            if (byteLen <= 256)
+            {
+                Span<byte> stackBuf = stackalloc byte[byteLen];
+                ReadExact(stackBuf);
+                return DecodeShortOrUtf8String(stackBuf);
+            }
+
+            byte[] buf = new byte[byteLen];
             ReadExact(buf);
             return Encoding.UTF8.GetString(buf);
+        }
+
+        private static string DecodeShortOrUtf8String(ReadOnlySpan<byte> slice)
+        {
+            if (slice.Length == 1)
+            {
+                return slice[0] switch
+                {
+                    (byte)'r' => CborObjectKeys.RefId,
+                    (byte)'b' => CborObjectKeys.BaseObject,
+                    (byte)'c' => CborObjectKeys.Container,
+                    (byte)'p' => CborObjectKeys.AdaptedProperties,
+                    (byte)'0' => "0",
+                    (byte)'1' => "1",
+                    _ => Encoding.UTF8.GetString(slice)
+                };
+            }
+
+            if (slice.Length == 2)
+            {
+                byte b0 = slice[0];
+                byte b1 = slice[1];
+                if (b0 == (byte)'t')
+                {
+                    if (b1 == (byte)'n')
+                    {
+                        return CborObjectKeys.TypeNames;
+                    }
+
+                    if (b1 == (byte)'s')
+                    {
+                        return CborObjectKeys.ToStringValue;
+                    }
+                }
+                else if (b0 == (byte)'m' && b1 == (byte)'s')
+                {
+                    return CborObjectKeys.MemberSet;
+                }
+                else if (b0 == (byte)'s' && b1 == (byte)'n')
+                {
+                    return CborObjectKeys.StreamName;
+                }
+            }
+            else if (slice.Length == 3 && slice[0] == (byte)'t' && slice[1] == (byte)'n' && slice[2] == (byte)'r')
+            {
+                return CborObjectKeys.TypeNamesRefId;
+            }
+
+            return Encoding.UTF8.GetString(slice);
         }
 
         internal ulong? ReadStartArray()
@@ -2607,6 +2963,45 @@ namespace System.Management.Automation
                 return (ulong)additional;
             }
 
+            if (_useMemory)
+            {
+                ReadOnlySpan<byte> span = _memory.Span;
+                switch (additional)
+                {
+                    case 24:
+                        return ReadByte();
+                    case 25:
+                        if (_pos + 2 > span.Length)
+                        {
+                            throw new EndOfStreamException("Unexpected end of CBOR stream.");
+                        }
+
+                        ushort u16 = BinaryPrimitives.ReadUInt16BigEndian(span.Slice(_pos, 2));
+                        _pos += 2;
+                        return u16;
+                    case 26:
+                        if (_pos + 4 > span.Length)
+                        {
+                            throw new EndOfStreamException("Unexpected end of CBOR stream.");
+                        }
+
+                        uint u32 = BinaryPrimitives.ReadUInt32BigEndian(span.Slice(_pos, 4));
+                        _pos += 4;
+                        return u32;
+                    case 27:
+                        if (_pos + 8 > span.Length)
+                        {
+                            throw new EndOfStreamException("Unexpected end of CBOR stream.");
+                        }
+
+                        ulong u64 = BinaryPrimitives.ReadUInt64BigEndian(span.Slice(_pos, 8));
+                        _pos += 8;
+                        return u64;
+                    default:
+                        throw new FormatException($"Invalid CBOR additional information: {additional}");
+                }
+            }
+
             switch (additional)
             {
                 case 24:
@@ -2636,6 +3031,16 @@ namespace System.Management.Automation
 
         private int PeekByte()
         {
+            if (_useMemory)
+            {
+                if (_pos >= _memory.Length)
+                {
+                    throw new EndOfStreamException("Unexpected end of CBOR stream.");
+                }
+
+                return _memory.Span[_pos];
+            }
+
             if (_peekedByte < 0)
             {
                 _peekedByte = _stream.ReadByte();
@@ -2650,6 +3055,16 @@ namespace System.Management.Automation
 
         private byte ReadByte()
         {
+            if (_useMemory)
+            {
+                if (_pos >= _memory.Length)
+                {
+                    throw new EndOfStreamException("Unexpected end of CBOR stream.");
+                }
+
+                return _memory.Span[_pos++];
+            }
+
             int b = PeekByte();
             _peekedByte = -1;
             return (byte)b;
@@ -2657,6 +3072,18 @@ namespace System.Management.Automation
 
         private void ReadExact(Span<byte> buffer)
         {
+            if (_useMemory)
+            {
+                if (_pos + buffer.Length > _memory.Length)
+                {
+                    throw new EndOfStreamException("Unexpected end of CBOR stream.");
+                }
+
+                _memory.Span.Slice(_pos, buffer.Length).CopyTo(buffer);
+                _pos += buffer.Length;
+                return;
+            }
+
             int offset = 0;
             if (_peekedByte >= 0 && buffer.Length > 0)
             {

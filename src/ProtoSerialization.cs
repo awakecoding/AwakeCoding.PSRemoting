@@ -49,9 +49,7 @@ namespace System.Management.Automation
         /// <returns>The serialized object as a Protobuf byte array.</returns>
         public static byte[] Serialize(object? source, int depth)
         {
-            using MemoryStream ms = new();
-            Serialize(source, ms, depth);
-            return ms.ToArray();
+            return InternalProtoSerializer.SerializeToBytes(source, new SerializationContext(depth, useDepthFromTypes: true));
         }
 
         /// <summary>
@@ -111,20 +109,30 @@ namespace System.Management.Automation
         /// <returns>An object that represents the serialized content.</returns>
         public static object? Deserialize(byte[] source)
         {
-            object?[] results = DeserializeAsList(source);
+            if (source is null)
+            {
+                throw PSTraceSource.NewArgumentNullException(nameof(source));
+            }
 
-            if (results.Length == 0)
+            ProtoDeserializer deserializer = new((ReadOnlyMemory<byte>)source);
+            if (deserializer.Done())
             {
                 return null;
             }
-            else if (results.Length == 1)
+
+            object? first = deserializer.Deserialize();
+            if (deserializer.Done())
             {
-                return results[0];
+                return first;
             }
-            else
+
+            List<object?> results = new() { first };
+            while (!deserializer.Done())
             {
-                return results;
+                results.Add(deserializer.Deserialize());
             }
+
+            return results.ToArray();
         }
 
         /// <summary>
@@ -160,8 +168,15 @@ namespace System.Management.Automation
                 throw PSTraceSource.NewArgumentNullException(nameof(source));
             }
 
-            using MemoryStream ms = new(source, writable: false);
-            return DeserializeAsList(ms);
+            List<object?> results = new();
+            ProtoDeserializer deserializer = new((ReadOnlyMemory<byte>)source);
+            while (!deserializer.Done())
+            {
+                object? result = deserializer.Deserialize();
+                results.Add(result);
+            }
+
+            return results.ToArray();
         }
 
         /// <summary>
@@ -356,6 +371,22 @@ namespace System.Management.Automation
             _deserializer.Start();
         }
 
+        internal ProtoDeserializer(ReadOnlyMemory<byte> memory)
+            : this(memory, new DeserializationContext())
+        {
+        }
+
+        internal ProtoDeserializer(ReadOnlyMemory<byte> memory, DeserializationContext context)
+        {
+            if (context is null)
+            {
+                throw PSTraceSource.NewArgumentNullException(nameof(context));
+            }
+
+            _deserializer = new InternalProtoDeserializer(memory, context);
+            _deserializer.Start();
+        }
+
         internal TypeTable? TypeTable
         {
             get => _deserializer.TypeTable;
@@ -422,6 +453,26 @@ namespace System.Management.Automation
         internal void Reset()
         {
             _pos = 0;
+        }
+
+        internal void WriteRawBytes(ReadOnlySpan<byte> bytes)
+        {
+            EnsureCapacity(bytes.Length);
+            bytes.CopyTo(_buffer.AsSpan(_pos, bytes.Length));
+            _pos += bytes.Length;
+        }
+
+        internal int BeginDelimitedFrame()
+        {
+            EnsureCapacity(1);
+            int lengthToken = _pos;
+            _pos++;
+            return lengthToken;
+        }
+
+        internal void EndDelimitedFrame(int lengthToken)
+        {
+            EndSubMessage(lengthToken);
         }
 
         internal void WriteToStreamDelimited(Stream stream)
@@ -805,8 +856,13 @@ namespace System.Management.Automation
     {
         private const int MaxDepthBelowTopLevel = 50;
 
+        [ThreadStatic]
+        private static ProtoBufferWriter? t_sharedWriter;
+        [ThreadStatic]
+        private static bool t_sharedWriterInUse;
+
         private readonly Stream _stream;
-        private readonly ProtoBufferWriter _writer = new(1024);
+        private readonly ProtoBufferWriter _writer;
         private readonly SerializationContext _context;
         private readonly ReferenceIdHandlerForSerializer<object> _objectRefIdHandler;
         private readonly ReferenceIdHandlerForSerializer<ConsolidatedString> _typeRefIdHandler;
@@ -819,10 +875,21 @@ namespace System.Management.Automation
         private Collection<CollectionEntry<PSPropertyInfo>>? _allPropertiesCollection;
 
         internal InternalProtoSerializer(Stream stream, SerializationContext context)
+            : this(stream, new ProtoBufferWriter(1024), context)
+        {
+        }
+
+        internal InternalProtoSerializer(ProtoBufferWriter writer, SerializationContext context)
+            : this(Stream.Null, writer, context)
+        {
+        }
+
+        private InternalProtoSerializer(Stream stream, ProtoBufferWriter writer, SerializationContext context)
         {
             Dbg.Assert(stream is not null, "caller should validate the parameter");
             Dbg.Assert(context is not null, "caller should validate the parameter");
             _stream = stream;
+            _writer = writer;
             _context = context;
 
             IDictionary<object, ulong>? objectRefIdDictionary = null;
@@ -834,6 +901,70 @@ namespace System.Management.Automation
             _objectRefIdHandler = new ReferenceIdHandlerForSerializer<object>(objectRefIdDictionary);
             _typeRefIdHandler = new ReferenceIdHandlerForSerializer<ConsolidatedString>(
                 new Dictionary<ConsolidatedString, ulong>(ConsolidatedString.EqualityComparer));
+        }
+
+        internal static byte[] SerializeToBytes(object? source, SerializationContext context)
+        {
+            bool rented = !t_sharedWriterInUse;
+            ProtoBufferWriter writer = rented
+                ? (t_sharedWriter ??= new ProtoBufferWriter(2048))
+                : new ProtoBufferWriter(1024);
+            if (rented)
+            {
+                t_sharedWriterInUse = true;
+            }
+
+            try
+            {
+                writer.Reset();
+                if ((context.options & SerializationOptions.NoRootElement) != SerializationOptions.NoRootElement)
+                {
+                    writer.WriteRawBytes(ProtoSchema.StreamMagic);
+                }
+
+                InternalProtoSerializer serializer = new(writer, context);
+                serializer.WriteOneTopLevelObjectToBuffer(source, streamName: null);
+                return writer.WrittenSpan.ToArray();
+            }
+            finally
+            {
+                if (rented)
+                {
+                    t_sharedWriterInUse = false;
+                }
+            }
+        }
+
+        internal static Google.Protobuf.ByteString SerializeToByteString(object? source, SerializationContext context)
+        {
+            bool rented = !t_sharedWriterInUse;
+            ProtoBufferWriter writer = rented
+                ? (t_sharedWriter ??= new ProtoBufferWriter(2048))
+                : new ProtoBufferWriter(1024);
+            if (rented)
+            {
+                t_sharedWriterInUse = true;
+            }
+
+            try
+            {
+                writer.Reset();
+                if ((context.options & SerializationOptions.NoRootElement) != SerializationOptions.NoRootElement)
+                {
+                    writer.WriteRawBytes(ProtoSchema.StreamMagic);
+                }
+
+                InternalProtoSerializer serializer = new(writer, context);
+                serializer.WriteOneTopLevelObjectToBuffer(source, streamName: null);
+                return Google.Protobuf.ByteString.CopyFrom(writer.WrittenSpan);
+            }
+            finally
+            {
+                if (rented)
+                {
+                    t_sharedWriterInUse = false;
+                }
+            }
         }
 
         internal TypeTable? TypeTable
@@ -887,6 +1018,14 @@ namespace System.Management.Automation
             }
         }
 
+        internal void WriteOneTopLevelObjectToBuffer(object? source, string? streamName)
+        {
+            Dbg.Assert(_depthBelowTopLevel == 0, "InternalProtoSerializer.depthBelowTopLevel should be 0 at top-level");
+            int frameToken = _writer.BeginDelimitedFrame();
+            WritePSValueBody(source, propertyName: null, streamName: streamName, _context.depth);
+            _writer.EndDelimitedFrame(frameToken);
+        }
+
         internal void WriteOneTopLevelObject(object? source, string? streamName)
         {
             Dbg.Assert(_depthBelowTopLevel == 0, "InternalProtoSerializer.depthBelowTopLevel should be 0 at top-level");
@@ -932,8 +1071,6 @@ namespace System.Management.Automation
                     return;
                 }
 
-                depth = GetDepthOfSerialization(source, depth);
-
                 if (HandlePrimitiveKnownTypeByConvertingToPSObject(source, depth))
                 {
                     return;
@@ -950,6 +1087,8 @@ namespace System.Management.Automation
                 {
                     return;
                 }
+
+                depth = GetDepthOfSerialization(source, depth);
 
                 if (HandleKnownContainerTypes(source, depth))
                 {
@@ -973,10 +1112,10 @@ namespace System.Management.Automation
 
         private bool HandlePrimitiveKnownTypeByConvertingToPSObject(object source, int depth)
         {
-            if (IsKnownProtoPrimitive(source.GetType()))
+            if (source is not PSObject && IsKnownProtoPrimitive(source.GetType()))
             {
-                PSObject pktInfoPSObject = PSObject.AsPSObject(source);
-                return HandlePrimitiveKnownTypePSObject(pktInfoPSObject, depth);
+                WriteOnePrimitiveKnownType(source);
+                return true;
             }
 
             return false;
@@ -989,7 +1128,7 @@ namespace System.Management.Automation
                 object baseObject = moSource.ImmediateBaseObject;
                 if (IsKnownProtoPrimitive(baseObject.GetType()))
                 {
-                    WritePrimitiveTypePSObject(moSource, baseObject, depth);
+                    WritePrimitiveTypePSObject(moSource, baseObject, depth, depthResolved: false);
                     return true;
                 }
             }
@@ -1002,7 +1141,7 @@ namespace System.Management.Automation
             return KnownTypes.GetTypeSerializationInfo(type) is not null;
         }
 
-        private void WritePrimitiveTypePSObject(PSObject source, object? primitive, int depth)
+        private void WritePrimitiveTypePSObject(PSObject source, object? primitive, int depth, bool depthResolved = true)
         {
             string? toStringValue = SerializationUtilities.GetToStringForPrimitiveObject(source);
             bool hasModifiedTypesCollection = PSObjectHasModifiedTypesCollection(source);
@@ -1011,6 +1150,11 @@ namespace System.Management.Automation
 
             if (hasNotes || hasModifiedTypesCollection || hasModifiedToString)
             {
+                if (!depthResolved)
+                {
+                    depth = GetDepthOfSerialization(source, depth);
+                }
+
                 string? refId = _objectRefIdHandler.SetRefId(source);
                 int objToken = _writer.BeginSubMessage(ProtoSchema.Val_Complex);
 
@@ -1458,7 +1602,7 @@ namespace System.Management.Automation
 
         private void SerializeInstanceProperties(PSObject source, int depth)
         {
-            PSMemberInfoCollection<PSMemberInfo>? instanceMembers = source.InstanceMembers;
+            PSMemberInfoCollection<PSMemberInfo>? instanceMembers = SmaInternalBridge.TryGetNonEmptyInstanceMembers(source);
             if (instanceMembers is not null)
             {
                 WriteMemberInfoCollection(instanceMembers, depth, isTopLevelObjectMemberSet: true);
@@ -1473,6 +1617,17 @@ namespace System.Management.Automation
             IEnumerable<PSMemberInfo>? extendedMembersEnumerable;
             if (specificPropertiesToSerialize is null)
             {
+                if (!SmaInternalBridge.HasTypeTableMembers(source, _typeTable))
+                {
+                    PSMemberInfoCollection<PSMemberInfo>? instanceMembers = SmaInternalBridge.TryGetNonEmptyInstanceMembers(source);
+                    if (instanceMembers is not null)
+                    {
+                        WriteMemberInfoCollection(instanceMembers, depth, isTopLevelObjectMemberSet: true);
+                    }
+
+                    return;
+                }
+
                 PSMemberInfoIntegratingCollection<PSMemberInfo> membersToSearch =
                     new(source, ExtendedMembersCollection);
                 extendedMembersEnumerable = membersToSearch.Match(
@@ -1482,7 +1637,8 @@ namespace System.Management.Automation
             }
             else
             {
-                List<PSMemberInfo> extendedMembersList = new(source.InstanceMembers);
+                PSMemberInfoCollection<PSMemberInfo>? instanceMembers = SmaInternalBridge.TryGetNonEmptyInstanceMembers(source);
+                List<PSMemberInfo> extendedMembersList = instanceMembers is not null ? new(instanceMembers) : new();
                 extendedMembersEnumerable = extendedMembersList;
 
                 foreach (PSMemberInfo member in specificPropertiesToSerialize)
@@ -1628,6 +1784,11 @@ namespace System.Management.Automation
 
         private static bool PSObjectHasModifiedTypesCollection(PSObject pso)
         {
+            if (!SmaInternalBridge.HasInstanceTypeName(pso))
+            {
+                return false;
+            }
+
             ConsolidatedString currentTypes = pso.InternalTypeNames;
             Collection<string> originalTypes = pso.InternalAdapter.BaseGetTypeNameHierarchy(pso.ImmediateBaseObject);
 
@@ -1636,11 +1797,9 @@ namespace System.Management.Automation
                 return true;
             }
 
-            using IEnumerator<string> currentEnumerator = currentTypes.GetEnumerator();
-            using IEnumerator<string> originalEnumerator = originalTypes.GetEnumerator();
-            while (currentEnumerator.MoveNext() && originalEnumerator.MoveNext())
+            for (int i = 0; i < currentTypes.Count; i++)
             {
-                if (!currentEnumerator.Current.Equals(originalEnumerator.Current, StringComparison.OrdinalIgnoreCase))
+                if (!currentTypes[i].Equals(originalTypes[i], StringComparison.OrdinalIgnoreCase))
                 {
                     return true;
                 }
@@ -1651,7 +1810,7 @@ namespace System.Management.Automation
 
         private static bool PSObjectHasNotes(PSObject source)
         {
-            return source.InstanceMembers is not null && source.InstanceMembers.Count > 0;
+            return SmaInternalBridge.HasInstanceMembers(source);
         }
     }
 
@@ -1662,12 +1821,15 @@ namespace System.Management.Automation
     {
         private const int MaxDepthBelowTopLevel = 50;
 
-        private readonly Stream _stream;
+        private readonly Stream? _stream;
+        private readonly ReadOnlyMemory<byte> _memory;
+        private readonly bool _hasMemory;
+        private int _memoryPos;
         private readonly DeserializationContext _context;
         private readonly ReferenceIdHandlerForDeserializer<object> _objectRefIdHandler = new();
         private readonly ReferenceIdHandlerForDeserializer<ConsolidatedString> _typeRefIdHandler = new();
 
-        private byte[] _frameBuffer = new byte[1024];
+        private byte[] _frameBuffer;
         private TypeTable? _typeTable;
         private int _depthBelowTopLevel;
         private bool _isStopping;
@@ -1679,6 +1841,16 @@ namespace System.Management.Automation
             Dbg.Assert(stream is not null, "caller should validate the parameter");
             Dbg.Assert(context is not null, "caller should validate the parameter");
             _stream = stream;
+            _frameBuffer = new byte[1024];
+            _context = context;
+        }
+
+        internal InternalProtoDeserializer(ReadOnlyMemory<byte> memory, DeserializationContext context)
+        {
+            Dbg.Assert(context is not null, "caller should validate the parameter");
+            _memory = memory;
+            _hasMemory = true;
+            _frameBuffer = Array.Empty<byte>();
             _context = context;
         }
 
@@ -1692,6 +1864,37 @@ namespace System.Management.Automation
 
         internal void Start()
         {
+            if (_hasMemory)
+            {
+                ReadOnlySpan<byte> span = _memory.Span;
+                if (span.IsEmpty)
+                {
+                    _done = true;
+                    return;
+                }
+
+                if ((_context.options & DeserializationOptions.NoRootElement) == DeserializationOptions.NoRootElement)
+                {
+                    return;
+                }
+
+                if (span[0] == (byte)'P')
+                {
+                    if (span.Length < 4 || !span.Slice(0, 4).SequenceEqual(ProtoSchema.StreamMagic))
+                    {
+                        throw new FormatException("Invalid PowerShell Protobuf (PSPB) stream header.");
+                    }
+
+                    _memoryPos = 4;
+                    if (_memoryPos >= span.Length)
+                    {
+                        _done = true;
+                    }
+                }
+
+                return;
+            }
+
             if (PeekByte() == -1)
             {
                 _done = true;
@@ -1727,6 +1930,16 @@ namespace System.Management.Automation
                 return true;
             }
 
+            if (_hasMemory)
+            {
+                if (_memoryPos >= _memory.Length)
+                {
+                    _done = true;
+                }
+
+                return _done;
+            }
+
             if (PeekByte() == -1)
             {
                 _done = true;
@@ -1756,13 +1969,25 @@ namespace System.Management.Automation
                 return false;
             }
 
+            if (_hasMemory)
+            {
+                int memFrameLen = checked((int)ReadVarint32FromMemory());
+                if (memFrameLen < 0 || _memoryPos + memFrameLen > _memory.Length)
+                {
+                    throw new FormatException("Unexpected EOF while skipping Protobuf frame.");
+                }
+
+                _memoryPos += memFrameLen;
+                return true;
+            }
+
             int frameLength = checked((int)ReadVarint32FromStream());
             if (frameLength == 0)
             {
                 return true;
             }
 
-            if (_stream.CanSeek)
+            if (_stream!.CanSeek)
             {
                 _stream.Seek(frameLength, SeekOrigin.Current);
                 return true;
@@ -1788,6 +2013,19 @@ namespace System.Management.Automation
         internal object? ReadOneTopLevelObject(out string? streamName)
         {
             CheckIfStopping();
+            if (_hasMemory)
+            {
+                int memFrameLen = checked((int)ReadVarint32FromMemory());
+                if (memFrameLen < 0 || _memoryPos + memFrameLen > _memory.Length)
+                {
+                    throw new FormatException("Unexpected EOF while reading Protobuf frame.");
+                }
+
+                ReadOnlySpan<byte> memFrameSpan = _memory.Span.Slice(_memoryPos, memFrameLen);
+                _memoryPos += memFrameLen;
+                return ReadPSValueFromSpan(memFrameSpan, out _, out streamName);
+            }
+
             int frameLength = checked((int)ReadVarint32FromStream());
             EnsureFrameBuffer(frameLength);
             Span<byte> frameSpan = _frameBuffer.AsSpan(0, frameLength);
@@ -2155,7 +2393,8 @@ namespace System.Management.Automation
             ContainerType containerKind = ContainerType.None;
             ArrayList? collectionItems = null;
             ProtoPSDictionary? dictionary = null;
-            bool adaptedPropsInitialized = false;
+            PSMemberInfoInternalCollection<PSPropertyInfo>? adaptedMembers = null;
+            PSMemberInfoCollection<PSMemberInfo>? instanceMembers = null;
 
             ProtoSpanReader reader = new(span);
             while (reader.TryReadTag(out int fieldNumber, out int wireType))
@@ -2188,7 +2427,7 @@ namespace System.Management.Automation
                     case ProtoSchema.Obj_ToString:
                         {
                             dso.ToStringFromDeserialization = reader.ReadString();
-                            dso.InstanceMembers.Add(PSObject.DotNetInstanceAdapter.GetDotNetMethod<PSMemberInfo>(dso, "ToString"));
+                            (instanceMembers ??= dso.InstanceMembers).Add(PSObject.DotNetInstanceAdapter.GetDotNetMethod<PSMemberInfo>(dso, "ToString"));
                             System.Management.Automation.Language.PSGetMemberBinder.SetHasInstanceMember("ToString");
                             dso.TokenText = dso.ToStringFromDeserialization;
                             break;
@@ -2246,21 +2485,21 @@ namespace System.Management.Automation
 
                     case ProtoSchema.Obj_AdaptedProps:
                         {
-                            if (!adaptedPropsInitialized)
+                            if (adaptedMembers is null)
                             {
                                 dso.IsDeserialized = true;
-                                dso.AdaptedMembers = new PSMemberInfoInternalCollection<PSPropertyInfo>();
-                                dso.InstanceMembers.Add(PSObject.DotNetInstanceAdapter.GetDotNetMethod<PSMemberInfo>(dso, "GetType"));
+                                adaptedMembers = new PSMemberInfoInternalCollection<PSPropertyInfo>();
+                                dso.AdaptedMembers = adaptedMembers;
+                                (instanceMembers ??= dso.InstanceMembers).Add(PSObject.DotNetInstanceAdapter.GetDotNetMethod<PSMemberInfo>(dso, "GetType"));
                                 System.Management.Automation.Language.PSGetMemberBinder.SetHasInstanceMember("GetType");
                                 dso.ClrMembers = new PSMemberInfoInternalCollection<PSPropertyInfo>();
-                                adaptedPropsInitialized = true;
                             }
 
                             ReadOnlySpan<byte> propSpan = reader.ReadLengthDelimitedSpan();
                             object? propValue = ReadPSValueFromSpan(propSpan, out string? propName);
                             if (!string.IsNullOrEmpty(propName))
                             {
-                                dso.AdaptedMembers.Add(SmaInternalBridge.CreateDeserializedPSProperty(propName, propValue));
+                                adaptedMembers.Add(SmaInternalBridge.CreateDeserializedPSProperty(propName, propValue), preValidated: true);
                             }
 
                             break;
@@ -2273,7 +2512,7 @@ namespace System.Management.Automation
                             if (!string.IsNullOrEmpty(noteName))
                             {
                                 PSNoteProperty note = new(noteName, noteVal);
-                                dso.InstanceMembers.Add(note);
+                                (instanceMembers ??= dso.InstanceMembers).Add(note, preValidated: true);
                                 System.Management.Automation.Language.PSGetMemberBinder.SetHasInstanceMember(note.Name);
                             }
 
@@ -2283,7 +2522,7 @@ namespace System.Management.Automation
                     case ProtoSchema.Obj_MemberSets:
                         {
                             ReadOnlySpan<byte> setSpan = reader.ReadLengthDelimitedSpan();
-                            ReadMemberSet(setSpan, dso.InstanceMembers);
+                            ReadMemberSet(setSpan, instanceMembers ??= dso.InstanceMembers);
                             break;
                         }
 
@@ -2362,10 +2601,11 @@ namespace System.Management.Automation
                 }
             }
 
-            dso.InternalTypeNames = new ConsolidatedString(typeNames);
+            var consolidated = new ConsolidatedString(typeNames);
+            dso.InternalTypeNames = consolidated;
             if (refId is not null)
             {
-                _typeRefIdHandler.SetRefId(dso.InternalTypeNames, refId, DuplicateRefIdsAllowed);
+                _typeRefIdHandler.SetRefId(consolidated, refId, DuplicateRefIdsAllowed);
             }
         }
 
@@ -2378,7 +2618,7 @@ namespace System.Management.Automation
             }
 
             _context.LogExtraMemoryUsage((typeNames.Key.Length * sizeof(char)) - 8);
-            dso.InternalTypeNames = new ConsolidatedString(typeNames);
+            dso.InternalTypeNames = typeNames;
         }
 
         private void ReadDictionaryEntry(ReadOnlySpan<byte> span, ProtoPSDictionary dictionary)
@@ -2462,11 +2702,36 @@ namespace System.Management.Automation
 
         #region Stream Helpers
 
+        private uint ReadVarint32FromMemory()
+        {
+            ReadOnlySpan<byte> span = _memory.Span;
+            uint result = 0;
+            int shift = 0;
+            while (shift < 35)
+            {
+                if (_memoryPos >= span.Length)
+                {
+                    throw new FormatException("Unexpected EOF while reading Protobuf frame length varint.");
+                }
+
+                byte b = span[_memoryPos++];
+                result |= (uint)(b & 0x7F) << shift;
+                if ((b & 0x80) == 0)
+                {
+                    return result;
+                }
+
+                shift += 7;
+            }
+
+            throw new FormatException("Malformed Protobuf frame length varint.");
+        }
+
         private int PeekByte()
         {
             if (_peekedByte == -2)
             {
-                _peekedByte = _stream.ReadByte();
+                _peekedByte = _stream!.ReadByte();
             }
 
             return _peekedByte;
@@ -2481,7 +2746,7 @@ namespace System.Management.Automation
                 return b;
             }
 
-            return _stream.ReadByte();
+            return _stream!.ReadByte();
         }
 
         private int ReadBytesFromStream(Span<byte> destination)
@@ -2496,7 +2761,7 @@ namespace System.Management.Automation
 
             while (totalRead < destination.Length)
             {
-                int n = _stream.Read(destination.Slice(totalRead));
+                int n = _stream!.Read(destination.Slice(totalRead));
                 if (n <= 0)
                 {
                     break;

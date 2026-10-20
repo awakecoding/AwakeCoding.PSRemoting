@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq.Expressions;
 using System.Management.Automation;
 using System.Management.Automation.Internal;
 using System.Management.Automation.Remoting;
@@ -138,6 +139,93 @@ namespace AwakeCoding.PSRemoting.PowerShell
         private static readonly PropertyInfo? s_rdoRunspacePoolIdProp = s_remoteDataObjectOfObjectType?.GetProperty("RunspacePoolId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         private static readonly PropertyInfo? s_rdoPowerShellIdProp = s_remoteDataObjectOfObjectType?.GetProperty("PowerShellId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
         private static readonly PropertyInfo? s_rdoDataProp = s_remoteDataObjectOfObjectType?.GetProperty("Data", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly Func<object, uint>? s_rdoGetDestination = CompileEnumUIntGetter(s_remoteDataObjectOfObjectType, s_rdoDestinationProp);
+        private static readonly Func<object, uint>? s_rdoGetDataType = CompileEnumUIntGetter(s_remoteDataObjectOfObjectType, s_rdoDataTypeProp);
+        private static readonly Func<object, Guid>? s_rdoGetRunspacePoolId = CompileGuidGetter(s_remoteDataObjectOfObjectType, s_rdoRunspacePoolIdProp);
+        private static readonly Func<object, Guid>? s_rdoGetPowerShellId = CompileGuidGetter(s_remoteDataObjectOfObjectType, s_rdoPowerShellIdProp);
+        private static readonly Func<object, object?>? s_rdoGetData = CompileObjectGetter(s_remoteDataObjectOfObjectType, s_rdoDataProp);
+        private static readonly Func<uint, uint, Guid, Guid, PSObject?, object>? s_rdoCreateFromDelegate = CompileRdoCreateFrom();
+
+        private static readonly SerializationContext s_defaultRemotingSerializationContext = new SerializationContext(
+            depth: 1,
+            options: SerializationOptions.RemotingOptions,
+            cryptoHelper: null);
+
+        private static readonly DeserializationContext s_defaultRemotingDeserializationContext = new DeserializationContext(
+            options: DeserializationOptions.RemotingOptions,
+            cryptoHelper: null);
+
+        private static Func<object, uint>? CompileEnumUIntGetter(Type? ownerType, PropertyInfo? prop)
+        {
+            if (ownerType == null || prop == null)
+            {
+                return null;
+            }
+
+            ParameterExpression objParam = Expression.Parameter(typeof(object), "obj");
+            UnaryExpression castObj = Expression.Convert(objParam, ownerType);
+            MemberExpression propAccess = Expression.Property(castObj, prop);
+            UnaryExpression toUInt = Expression.Convert(propAccess, typeof(uint));
+            return Expression.Lambda<Func<object, uint>>(toUInt, objParam).Compile();
+        }
+
+        private static Func<object, Guid>? CompileGuidGetter(Type? ownerType, PropertyInfo? prop)
+        {
+            if (ownerType == null || prop == null)
+            {
+                return null;
+            }
+
+            ParameterExpression objParam = Expression.Parameter(typeof(object), "obj");
+            UnaryExpression castObj = Expression.Convert(objParam, ownerType);
+            MemberExpression propAccess = Expression.Property(castObj, prop);
+            return Expression.Lambda<Func<object, Guid>>(propAccess, objParam).Compile();
+        }
+
+        private static Func<object, object?>? CompileObjectGetter(Type? ownerType, PropertyInfo? prop)
+        {
+            if (ownerType == null || prop == null)
+            {
+                return null;
+            }
+
+            ParameterExpression objParam = Expression.Parameter(typeof(object), "obj");
+            UnaryExpression castObj = Expression.Convert(objParam, ownerType);
+            MemberExpression propAccess = Expression.Property(castObj, prop);
+            UnaryExpression toObj = Expression.Convert(propAccess, typeof(object));
+            return Expression.Lambda<Func<object, object?>>(toObj, objParam).Compile();
+        }
+
+        private static Func<uint, uint, Guid, Guid, PSObject?, object>? CompileRdoCreateFrom()
+        {
+            if (s_rdoCreateFromMethod == null || s_remotingDestinationType == null || s_remotingDataTypeType == null)
+            {
+                return null;
+            }
+
+            ParameterExpression destParam = Expression.Parameter(typeof(uint), "destination");
+            ParameterExpression dtParam = Expression.Parameter(typeof(uint), "dataType");
+            ParameterExpression rpidParam = Expression.Parameter(typeof(Guid), "runspacePoolId");
+            ParameterExpression pidParam = Expression.Parameter(typeof(Guid), "powerShellId");
+            ParameterExpression dataParam = Expression.Parameter(typeof(PSObject), "data");
+
+            MethodCallExpression call = Expression.Call(
+                s_rdoCreateFromMethod,
+                Expression.Convert(destParam, s_remotingDestinationType),
+                Expression.Convert(dtParam, s_remotingDataTypeType),
+                rpidParam,
+                pidParam,
+                dataParam);
+
+            return Expression.Lambda<Func<uint, uint, Guid, Guid, PSObject?, object>>(
+                Expression.Convert(call, typeof(object)),
+                destParam,
+                dtParam,
+                rpidParam,
+                pidParam,
+                dataParam).Compile();
+        }
 
         private long _nextDirectObjectId;
         private readonly Dictionary<ulong, MemoryStream> _outboundInFlightObjects = new Dictionary<ulong, MemoryStream>();
@@ -395,19 +483,36 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 throw new ArgumentNullException(nameof(remoteDataObject));
             }
 
-            uint destination = s_rdoDestinationProp?.GetValue(remoteDataObject) is object destVal
-                ? Convert.ToUInt32(destVal, CultureInfo.InvariantCulture)
-                : 0u;
-            uint dataType = s_rdoDataTypeProp?.GetValue(remoteDataObject) is object dtVal
-                ? Convert.ToUInt32(dtVal, CultureInfo.InvariantCulture)
-                : 0u;
-            Guid runspacePoolId = s_rdoRunspacePoolIdProp?.GetValue(remoteDataObject) is Guid rsGuid
-                ? rsGuid
-                : Guid.Empty;
-            Guid powerShellId = s_rdoPowerShellIdProp?.GetValue(remoteDataObject) is Guid psIdGuid
-                ? psIdGuid
-                : Guid.Empty;
-            object? payloadObject = s_rdoDataProp?.GetValue(remoteDataObject);
+            uint destination;
+            uint dataType;
+            Guid runspacePoolId;
+            Guid powerShellId;
+            object? payloadObject;
+
+            if (s_rdoGetDestination != null && s_rdoGetDataType != null && s_rdoGetRunspacePoolId != null && s_rdoGetPowerShellId != null && s_rdoGetData != null)
+            {
+                destination = s_rdoGetDestination(remoteDataObject);
+                dataType = s_rdoGetDataType(remoteDataObject);
+                runspacePoolId = s_rdoGetRunspacePoolId(remoteDataObject);
+                powerShellId = s_rdoGetPowerShellId(remoteDataObject);
+                payloadObject = s_rdoGetData(remoteDataObject);
+            }
+            else
+            {
+                destination = s_rdoDestinationProp?.GetValue(remoteDataObject) is object destVal
+                    ? Convert.ToUInt32(destVal, CultureInfo.InvariantCulture)
+                    : 0u;
+                dataType = s_rdoDataTypeProp?.GetValue(remoteDataObject) is object dtVal
+                    ? Convert.ToUInt32(dtVal, CultureInfo.InvariantCulture)
+                    : 0u;
+                runspacePoolId = s_rdoRunspacePoolIdProp?.GetValue(remoteDataObject) is Guid rsGuid
+                    ? rsGuid
+                    : Guid.Empty;
+                powerShellId = s_rdoPowerShellIdProp?.GetValue(remoteDataObject) is Guid psIdGuid
+                    ? psIdGuid
+                    : Guid.Empty;
+                payloadObject = s_rdoDataProp?.GetValue(remoteDataObject);
+            }
 
             return EncodeDirectPayloadToFrames(
                 destination,
@@ -417,6 +522,18 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 payloadObject,
                 psGuid,
                 streamAttr);
+        }
+
+        private static ByteString GuidToByteString(Guid guid)
+        {
+            if (guid == Guid.Empty)
+            {
+                return ByteString.Empty;
+            }
+
+            Span<byte> guidBytes = stackalloc byte[16];
+            guid.TryWriteBytes(guidBytes);
+            return ByteString.CopyFrom(guidBytes);
         }
 
         /// <summary>
@@ -434,13 +551,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             ulong objectId = ((ulong)System.Threading.Interlocked.Increment(ref _nextDirectObjectId)) | 0x80000000_00000000UL;
             PsrpSerializationFormat wireEncoding = ToWireEncoding(Encoding);
-            byte[] binaryPayloadBytes = payloadObject != null
-                ? SerializeRemotingPayload(payloadObject, wireEncoding)
-                : Array.Empty<byte>();
-            ByteString rsPoolBytes = ByteString.CopyFrom(runspacePoolId.ToByteArray());
-            ByteString psBytes = ByteString.CopyFrom(powerShellId.ToByteArray());
+            ByteString payloadByteString = payloadObject != null
+                ? SerializeRemotingPayloadToByteString(payloadObject, wireEncoding)
+                : ByteString.Empty;
+            ByteString rsPoolBytes = GuidToByteString(runspacePoolId);
+            ByteString psBytes = GuidToByteString(powerShellId);
 
-            if (binaryPayloadBytes.Length <= DefaultMaxFragmentBlobSize)
+            if (payloadByteString.Length <= DefaultMaxFragmentBlobSize)
             {
                 yield return new PsrpPacket
                 {
@@ -454,23 +571,24 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     MessageType = (PsrpMessageType)dataType,
                     Rpid = rsPoolBytes,
                     Pid = psBytes,
-                    Data = ByteString.CopyFrom(binaryPayloadBytes),
+                    Data = payloadByteString,
                     SerializationFormat = wireEncoding
                 };
             }
             else
             {
+                ReadOnlyMemory<byte> payloadMem = payloadByteString.Memory;
                 int protoOffset = 0;
                 ulong outFragId = 0;
-                while (protoOffset < binaryPayloadBytes.Length)
+                while (protoOffset < payloadMem.Length)
                 {
-                    int chunkLen = Math.Min(DefaultMaxFragmentBlobSize, binaryPayloadBytes.Length - protoOffset);
+                    int chunkLen = Math.Min(DefaultMaxFragmentBlobSize, payloadMem.Length - protoOffset);
                     byte outFlags = 0;
                     if (protoOffset == 0)
                     {
                         outFlags |= FragmentFlagStart;
                     }
-                    if (protoOffset + chunkLen >= binaryPayloadBytes.Length)
+                    if (protoOffset + chunkLen >= payloadMem.Length)
                     {
                         outFlags |= FragmentFlagEnd;
                     }
@@ -487,7 +605,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                         MessageType = (PsrpMessageType)dataType,
                         Rpid = rsPoolBytes,
                         Pid = psBytes,
-                        Data = ByteString.CopyFrom(binaryPayloadBytes, protoOffset, chunkLen),
+                        Data = ByteString.CopyFrom(payloadMem.Slice(protoOffset, chunkLen).Span),
                         SerializationFormat = wireEncoding
                     };
 
@@ -547,15 +665,15 @@ namespace AwakeCoding.PSRemoting.PowerShell
             psGuid = ParsePsGuid(frame.PsGuid);
             remoteDataObject = null;
 
-            if (!TryReassembleInboundDataFrame(
+            if (!TryReassembleInboundDataFrameMemory(
                 frame,
                 out _,
                 out uint destination,
                 out uint dataType,
                 out PsrpSerializationFormat payloadEncoding,
-                out byte[] runspacePoolId,
-                out byte[] powerShellId,
-                out byte[] binaryPayloadBytes))
+                out ReadOnlyMemory<byte> runspacePoolId,
+                out ReadOnlyMemory<byte> powerShellId,
+                out ReadOnlyMemory<byte> binaryPayloadBytes))
             {
                 return false;
             }
@@ -575,19 +693,26 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 }
             }
 
-            Guid rsPoolGuid = runspacePoolId.Length == 16 ? new Guid(runspacePoolId) : Guid.Empty;
-            Guid psInstanceGuid = powerShellId.Length == 16 ? new Guid(powerShellId) : Guid.Empty;
+            Guid rsPoolGuid = runspacePoolId.Length == 16 ? new Guid(runspacePoolId.Span) : Guid.Empty;
+            Guid psInstanceGuid = powerShellId.Length == 16 ? new Guid(powerShellId.Span) : Guid.Empty;
 
-            remoteDataObject = s_rdoCreateFromMethod.Invoke(
-                obj: null,
-                new object?[]
-                {
-                    Enum.ToObject(s_remotingDestinationType, destination),
-                    Enum.ToObject(s_remotingDataTypeType, dataType),
-                    rsPoolGuid,
-                    psInstanceGuid,
-                    psObj!
-                });
+            if (s_rdoCreateFromDelegate != null)
+            {
+                remoteDataObject = s_rdoCreateFromDelegate(destination, dataType, rsPoolGuid, psInstanceGuid, psObj);
+            }
+            else
+            {
+                remoteDataObject = s_rdoCreateFromMethod.Invoke(
+                    obj: null,
+                    new object?[]
+                    {
+                        Enum.ToObject(s_remotingDestinationType, destination),
+                        Enum.ToObject(s_remotingDataTypeType, dataType),
+                        rsPoolGuid,
+                        psInstanceGuid,
+                        psObj!
+                    });
+            }
 
             return remoteDataObject != null;
         }
@@ -600,6 +725,54 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             return Guid.TryParse(psGuidText, out Guid parsed) ? parsed : Guid.Empty;
+        }
+
+        private bool TryReassembleInboundDataFrameMemory(
+            PsrpPacket frame,
+            out ulong objectId,
+            out uint destination,
+            out uint dataType,
+            out PsrpSerializationFormat payloadEncoding,
+            out ReadOnlyMemory<byte> runspacePoolId,
+            out ReadOnlyMemory<byte> powerShellId,
+            out ReadOnlyMemory<byte> protoPayloadBytes)
+        {
+            objectId = frame.ObjectId;
+            byte flags = (byte)frame.FragmentFlags;
+            bool isStart = (flags & FragmentFlagStart) != 0;
+            bool isEnd = (flags & FragmentFlagEnd) != 0;
+
+            if (isStart && isEnd)
+            {
+                destination = (uint)frame.Destination;
+                dataType = (uint)frame.MessageType;
+                payloadEncoding = frame.SerializationFormat;
+                runspacePoolId = frame.Rpid.Memory;
+                powerShellId = frame.Pid.Memory;
+                protoPayloadBytes = frame.Data.Memory;
+                return true;
+            }
+
+            if (TryReassembleInboundDataFrame(
+                frame,
+                out objectId,
+                out destination,
+                out dataType,
+                out payloadEncoding,
+                out byte[] rpidArr,
+                out byte[] pidArr,
+                out byte[] payloadArr))
+            {
+                runspacePoolId = rpidArr;
+                powerShellId = pidArr;
+                protoPayloadBytes = payloadArr;
+                return true;
+            }
+
+            runspacePoolId = ReadOnlyMemory<byte>.Empty;
+            powerShellId = ReadOnlyMemory<byte>.Empty;
+            protoPayloadBytes = ReadOnlyMemory<byte>.Empty;
+            return false;
         }
 
         private bool TryReassembleInboundDataFrame(
@@ -788,64 +961,76 @@ namespace AwakeCoding.PSRemoting.PowerShell
             };
         }
 
+        internal static ByteString SerializeRemotingPayloadToByteString(object? obj, PsrpSerializationFormat wireEncoding)
+        {
+            return wireEncoding switch
+            {
+                PsrpSerializationFormat.Cbor => InternalCborSerializer.SerializeToByteString(obj!, s_defaultRemotingSerializationContext),
+                PsrpSerializationFormat.Clixml => ByteString.CopyFrom(SerializeClixmlRemotingPayload(obj)),
+                _ => InternalProtoSerializer.SerializeToByteString(obj!, s_defaultRemotingSerializationContext)
+            };
+        }
+
         internal static object? DeserializeRemotingPayload(byte[] payloadBytes, PsrpSerializationFormat wireEncoding)
+        {
+            return DeserializeRemotingPayload(new ReadOnlyMemory<byte>(payloadBytes), wireEncoding);
+        }
+
+        internal static object? DeserializeRemotingPayload(ReadOnlyMemory<byte> payloadBytes, PsrpSerializationFormat wireEncoding)
         {
             return wireEncoding switch
             {
                 PsrpSerializationFormat.Cbor => DeserializeCborRemotingPayload(payloadBytes),
-                PsrpSerializationFormat.Clixml => DeserializeClixmlRemotingPayload(payloadBytes, 0, payloadBytes.Length),
+                PsrpSerializationFormat.Clixml => DeserializeClixmlRemotingPayload(payloadBytes),
                 _ => DeserializeProtoRemotingPayload(payloadBytes)
             };
         }
 
         internal static byte[] SerializeProtoRemotingPayload(object? obj)
         {
-            using var ms = new MemoryStream();
-            var context = new SerializationContext(
-                depth: 1,
-                options: SerializationOptions.RemotingOptions,
-                cryptoHelper: null);
-            var serializer = new ProtoSerializer(ms, context);
-            serializer.Serialize(obj!);
-            serializer.Done();
-            return ms.ToArray();
+            return InternalProtoSerializer.SerializeToBytes(obj!, s_defaultRemotingSerializationContext);
         }
 
         internal static object? DeserializeProtoRemotingPayload(byte[] protoBytes)
         {
-            using var ms = new MemoryStream(protoBytes, writable: false);
-            var context = new DeserializationContext(
-                options: DeserializationOptions.RemotingOptions,
-                cryptoHelper: null);
-            var deserializer = new ProtoDeserializer(ms, context);
+            return DeserializeProtoRemotingPayload(new ReadOnlyMemory<byte>(protoBytes));
+        }
+
+        internal static object? DeserializeProtoRemotingPayload(ReadOnlyMemory<byte> protoBytes)
+        {
+            var deserializer = new ProtoDeserializer(protoBytes, s_defaultRemotingDeserializationContext);
             object? result = deserializer.Deserialize();
             deserializer.Done();
-            return result == null ? null : PSObject.AsPSObject(result);
+            return result == null ? null : (result as PSObject ?? PSObject.AsPSObject(result));
         }
 
         internal static byte[] SerializeCborRemotingPayload(object? obj)
         {
-            using var ms = new MemoryStream();
-            var context = new SerializationContext(
-                depth: 1,
-                options: SerializationOptions.RemotingOptions,
-                cryptoHelper: null);
-            var serializer = new CborSerializer(ms, context);
-            serializer.Serialize(obj!);
-            serializer.Done();
-            return ms.ToArray();
+            return InternalCborSerializer.SerializeToBytes(obj!, s_defaultRemotingSerializationContext);
         }
 
         internal static object? DeserializeCborRemotingPayload(byte[] cborBytes)
         {
-            using var ms = new MemoryStream(cborBytes, writable: false);
-            var context = new DeserializationContext(
-                options: DeserializationOptions.RemotingOptions,
-                cryptoHelper: null);
-            var deserializer = new CborDeserializer(ms, context);
+            return DeserializeCborRemotingPayload(new ReadOnlyMemory<byte>(cborBytes));
+        }
+
+        internal static object? DeserializeCborRemotingPayload(ReadOnlyMemory<byte> cborBytes)
+        {
+            var deserializer = new CborDeserializer(cborBytes, s_defaultRemotingDeserializationContext);
             object? result = deserializer.Deserialize();
             deserializer.Done();
-            return result == null ? null : PSObject.AsPSObject(result);
+            return result == null ? null : (result as PSObject ?? PSObject.AsPSObject(result));
+        }
+
+        internal static object? DeserializeClixmlRemotingPayload(ReadOnlyMemory<byte> clixmlBytes)
+        {
+            if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(clixmlBytes, out ArraySegment<byte> segment) && segment.Array != null)
+            {
+                return DeserializeClixmlRemotingPayload(segment.Array, segment.Offset, segment.Count);
+            }
+
+            byte[] arr = clixmlBytes.ToArray();
+            return DeserializeClixmlRemotingPayload(arr, 0, arr.Length);
         }
 
         internal static object? DeserializeClixmlRemotingPayload(byte[] buffer, int offset, int count)
