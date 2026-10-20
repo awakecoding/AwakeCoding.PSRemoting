@@ -1467,6 +1467,72 @@ Describe 'End-to-End Client Transport Tests' {
             $rdoData = $rdoType.GetProperty('Data', $rdoFlags).GetValue($rdo)
             $rdoData.Message | Should -Be 'ProtoTest'
             $rdoData.Value | Should -Be 123
+
+            # Verify CBOR encoding mode on the same PSRP fragment
+            $cborCodec = [Activator]::CreateInstance($codecType, @([AwakeCoding.PSRemoting.PowerShell.PSHostGrpcEncoding]::Cbor))
+            $cborFrames = @($encodeRawMethod.Invoke($cborCodec, @([byte[]]$fragmentBytes.ToArray(), $psId.ToString(), 'Default')))
+            $cborFrames | Should -HaveCount 1
+            $cborFrame = $cborFrames[0]
+            $cborFrame.PayloadEncoding.ToString() | Should -Be 'Cbor'
+            $cborFrame.Payload.Length | Should -BeGreaterThan 0
+
+            $cborText = [System.Text.Encoding]::UTF8.GetString($cborFrame.Payload.ToByteArray())
+            $cborText | Should -Not -Match '<Obj'
+            $cborText | Should -Match 'ProtoTest'
+
+            $cborDecodeArgs = [object[]]@($cborFrame, [guid]::Empty, $null)
+            $hasCborRdo = $tryDecodeRdoMethod.Invoke($codec, $cborDecodeArgs)
+            $hasCborRdo | Should -BeTrue
+            $cborRdo = $cborDecodeArgs[2]
+            $cborRdoData = $rdoType.GetProperty('Data', $rdoFlags).GetValue($cborRdo)
+            $cborRdoData.Message | Should -Be 'ProtoTest'
+            $cborRdoData.Value | Should -Be 123
+        }
+
+        It 'Round-trips complex objects over CBOR-encoded gRPC transport (-GrpcEncoding Cbor)' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -GrpcEncoding Cbor -OpenTimeout 15000
+            try {
+                $guid = [guid]::NewGuid()
+                $result = Invoke-Command -Session $session -ScriptBlock {
+                    param($g)
+                    [pscustomobject]@{
+                        Id      = $g
+                        Version = [version]'4.5.6'
+                        Items   = @(100, 'cbor-hello', $false)
+                        Table   = @{ Mode = 'Cbor'; Count = 99 }
+                    }
+                } -ArgumentList $guid -ErrorAction Stop
+
+                $result.Id | Should -Be $guid
+                $result.Version.ToString() | Should -Be '4.5.6'
+                $result.Items | Should -HaveCount 3
+                $result.Items[0] | Should -Be 100
+                $result.Items[1] | Should -Be 'cbor-hello'
+                $result.Items[2] | Should -BeFalse
+                $result.Table['Mode'] | Should -Be 'Cbor'
+                $result.Table['Count'] | Should -Be 99
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Supports gRPC server started with -GrpcEncoding Cbor' {
+            $cborServer = Start-PSHostServer -TransportType Grpc -Port 0 -GrpcEncoding Cbor
+            try {
+                $cborServer.Encoding.ToString() | Should -Be 'Cbor'
+                $session = New-PSHostSession -GrpcUri $cborServer.GrpcUri -OpenTimeout 15000
+                try {
+                    $res = Invoke-Command -Session $session -ScriptBlock { 21 * 2 } -ErrorAction Stop
+                    $res | Should -Be 42
+                }
+                finally {
+                    Remove-PSHostSessionSafely -Session $session
+                }
+            }
+            finally {
+                Stop-PSHostServer -Server $cborServer -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 

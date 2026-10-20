@@ -49,6 +49,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
         [Parameter()]
         public SwitchParameter AllowUnencrypted { get; set; }
 
+        [Parameter()]
+        [Alias("Encoding")]
+        public PSHostGrpcEncoding GrpcEncoding { get; set; } = PSHostGrpcEncoding.Protobuf;
+
         // NamedPipe-specific parameters
         [Parameter(Position = 1)]
         [ValidateNotNullOrEmpty()]
@@ -316,7 +320,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 useSecureConnection: UseSecureConnection,
                 allowUnencrypted: AllowUnencrypted,
                 maxConnections: MaxConnections,
-                drainTimeout: DrainTimeout);
+                drainTimeout: DrainTimeout,
+                encoding: GrpcEncoding);
         }
     }
 

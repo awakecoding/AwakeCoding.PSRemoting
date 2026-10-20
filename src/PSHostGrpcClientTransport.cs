@@ -27,6 +27,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         public Uri GrpcUri { get; set; }
 
+        public PSHostGrpcEncoding Encoding { get; set; } = PSHostGrpcEncoding.Protobuf;
+
+        internal bool HasExplicitEncoding { get; set; }
+
         public new int OpenTimeout { get; set; } = 30000;
 
         public override PSCredential? Credential
@@ -57,7 +61,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             return new PSHostGrpcClientInfo(GrpcUri)
             {
-                OpenTimeout = OpenTimeout
+                OpenTimeout = OpenTimeout,
+                Encoding = Encoding,
+                HasExplicitEncoding = HasExplicitEncoding
             };
         }
 
@@ -156,6 +162,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             if (connectionInfo == null) { throw new PSArgumentException("connectionInfo"); }
             _connectionInfo = connectionInfo;
+            _outboundCodec.Encoding = connectionInfo.Encoding;
             _sessionSendCallback = CreateSendCallbackDelegate(this, Guid.Empty);
         }
 
@@ -190,7 +197,16 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             var client = new PSHostGrpcTransport.PSHostGrpcTransportClient(_channel);
-            _call = client.Connect();
+            Metadata? headers = null;
+            if (_connectionInfo.HasExplicitEncoding)
+            {
+                headers = new Metadata
+                {
+                    { "x-psremoting-encoding", _connectionInfo.Encoding.ToString().ToLowerInvariant() }
+                };
+            }
+
+            _call = client.Connect(headers);
 
             SetMessageWriter(new GrpcTextWriter(this));
 
@@ -545,6 +561,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         private void HandleInboundDataFrame(PSHostGrpcFrame frame)
         {
+            if (!_connectionInfo.HasExplicitEncoding)
+            {
+                _outboundCodec.Encoding = frame.PayloadEncoding == PSHostGrpcPayloadEncoding.Cbor
+                    ? PSHostGrpcEncoding.Cbor
+                    : PSHostGrpcEncoding.Protobuf;
+            }
+
             bool hasObject = _inboundCodec.TryDecodeDataFrameToRemoteDataObject(
                 frame,
                 out Guid psGuid,

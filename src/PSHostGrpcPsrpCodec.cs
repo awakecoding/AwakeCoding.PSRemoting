@@ -133,10 +133,23 @@ namespace AwakeCoding.PSRemoting.PowerShell
         private readonly Dictionary<ulong, MemoryStream> _outboundInFlightObjects = new Dictionary<ulong, MemoryStream>();
         private readonly Dictionary<ulong, ReassemblyBuffer> _inboundInFlightObjects = new Dictionary<ulong, ReassemblyBuffer>();
 
+        public PSHostGrpcEncoding Encoding { get; set; }
+
+        public PSHostGrpcPsrpCodec()
+            : this(PSHostGrpcEncoding.Protobuf)
+        {
+        }
+
+        public PSHostGrpcPsrpCodec(PSHostGrpcEncoding encoding)
+        {
+            Encoding = encoding;
+        }
+
         private sealed class ReassemblyBuffer
         {
             public uint Destination;
             public uint DataType;
+            public PSHostGrpcPayloadEncoding PayloadEncoding;
             public byte[] RunspacePoolId = Array.Empty<byte>();
             public byte[] PowerShellId = Array.Empty<byte>();
             public readonly MemoryStream PayloadStream = new MemoryStream();
@@ -287,19 +300,25 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 byte[] runspacePoolId = fullObjectBytes.AsSpan(8, 16).ToArray();
                 byte[] powerShellId = fullObjectBytes.AsSpan(24, 16).ToArray();
 
-                byte[] protoPayloadBytes;
+                PSHostGrpcPayloadEncoding wireEncoding = Encoding == PSHostGrpcEncoding.Cbor
+                    ? PSHostGrpcPayloadEncoding.Cbor
+                    : PSHostGrpcPayloadEncoding.Protobuf;
+
+                byte[] binaryPayloadBytes;
                 int clixmlLength = fullObjectBytes.Length - RemoteDataObjectHeaderLength;
                 if (clixmlLength > 0)
                 {
                     object? psObj = DeserializeClixmlRemotingPayload(fullObjectBytes, RemoteDataObjectHeaderLength, clixmlLength);
-                    protoPayloadBytes = SerializeProtoRemotingPayload(psObj);
+                    binaryPayloadBytes = wireEncoding == PSHostGrpcPayloadEncoding.Cbor
+                        ? SerializeCborRemotingPayload(psObj)
+                        : SerializeProtoRemotingPayload(psObj);
                 }
                 else
                 {
-                    protoPayloadBytes = Array.Empty<byte>();
+                    binaryPayloadBytes = Array.Empty<byte>();
                 }
 
-                if (protoPayloadBytes.Length <= DefaultMaxFragmentBlobSize)
+                if (binaryPayloadBytes.Length <= DefaultMaxFragmentBlobSize)
                 {
                     yield return new PSHostGrpcFrame
                     {
@@ -313,22 +332,23 @@ namespace AwakeCoding.PSRemoting.PowerShell
                         DataType = dataType,
                         RunspacePoolId = ByteString.CopyFrom(runspacePoolId),
                         PowershellId = ByteString.CopyFrom(powerShellId),
-                        Payload = ByteString.CopyFrom(protoPayloadBytes)
+                        Payload = ByteString.CopyFrom(binaryPayloadBytes),
+                        PayloadEncoding = wireEncoding
                     };
                 }
                 else
                 {
                     int protoOffset = 0;
                     ulong outFragId = 0;
-                    while (protoOffset < protoPayloadBytes.Length)
+                    while (protoOffset < binaryPayloadBytes.Length)
                     {
-                        int chunkLen = Math.Min(DefaultMaxFragmentBlobSize, protoPayloadBytes.Length - protoOffset);
+                        int chunkLen = Math.Min(DefaultMaxFragmentBlobSize, binaryPayloadBytes.Length - protoOffset);
                         byte outFlags = 0;
                         if (protoOffset == 0)
                         {
                             outFlags |= FragmentFlagStart;
                         }
-                        if (protoOffset + chunkLen >= protoPayloadBytes.Length)
+                        if (protoOffset + chunkLen >= binaryPayloadBytes.Length)
                         {
                             outFlags |= FragmentFlagEnd;
                         }
@@ -345,7 +365,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
                             DataType = dataType,
                             RunspacePoolId = ByteString.CopyFrom(runspacePoolId),
                             PowershellId = ByteString.CopyFrom(powerShellId),
-                            Payload = ByteString.CopyFrom(protoPayloadBytes, protoOffset, chunkLen)
+                            Payload = ByteString.CopyFrom(binaryPayloadBytes, protoOffset, chunkLen),
+                            PayloadEncoding = wireEncoding
                         };
 
                         protoOffset += chunkLen;
@@ -393,8 +414,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         /// <summary>
         /// Decodes an inbound <see cref="PSHostGrpcFrameKind.Data"/> frame directly into a
-        /// <c>RemoteDataObject&lt;PSObject&gt;</c> using <see cref="ProtoDeserializer"/> without
-        /// re-serializing to CLIXML, Base64, or <c>&lt;Data&gt;</c> XML.
+        /// <c>RemoteDataObject&lt;PSObject&gt;</c> using <see cref="ProtoDeserializer"/> or <see cref="CborDeserializer"/>
+        /// without re-serializing to CLIXML, Base64, or <c>&lt;Data&gt;</c> XML.
         /// Returns <c>true</c> when a complete PSRP object has been reassembled and decoded.
         /// </summary>
         public bool TryDecodeDataFrameToRemoteDataObject(
@@ -410,9 +431,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 out _,
                 out uint destination,
                 out uint dataType,
+                out PSHostGrpcPayloadEncoding payloadEncoding,
                 out byte[] runspacePoolId,
                 out byte[] powerShellId,
-                out byte[] protoPayloadBytes))
+                out byte[] binaryPayloadBytes))
             {
                 return false;
             }
@@ -422,9 +444,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 throw new InvalidOperationException("Failed to resolve RemoteDataObject<PSObject>.CreateFrom reflection binding.");
             }
 
-            PSObject? psObj = protoPayloadBytes.Length > 0
-                ? DeserializeProtoRemotingPayload(protoPayloadBytes) as PSObject
-                : null;
+            PSObject? psObj = null;
+            if (binaryPayloadBytes.Length > 0)
+            {
+                psObj = (payloadEncoding == PSHostGrpcPayloadEncoding.Cbor
+                    ? DeserializeCborRemotingPayload(binaryPayloadBytes)
+                    : DeserializeProtoRemotingPayload(binaryPayloadBytes)) as PSObject;
+            }
 
             Guid rsPoolGuid = runspacePoolId.Length == 16 ? new Guid(runspacePoolId) : Guid.Empty;
             Guid psInstanceGuid = powerShellId.Length == 16 ? new Guid(powerShellId) : Guid.Empty;
@@ -458,6 +484,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             out ulong objectId,
             out uint destination,
             out uint dataType,
+            out PSHostGrpcPayloadEncoding payloadEncoding,
             out byte[] runspacePoolId,
             out byte[] powerShellId,
             out byte[] protoPayloadBytes)
@@ -471,6 +498,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             {
                 destination = frame.Destination;
                 dataType = frame.DataType;
+                payloadEncoding = frame.PayloadEncoding;
                 runspacePoolId = frame.RunspacePoolId.ToByteArray();
                 powerShellId = frame.PowershellId.ToByteArray();
                 protoPayloadBytes = frame.Payload.ToByteArray();
@@ -483,6 +511,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 {
                     Destination = frame.Destination,
                     DataType = frame.DataType,
+                    PayloadEncoding = frame.PayloadEncoding,
                     RunspacePoolId = frame.RunspacePoolId.ToByteArray(),
                     PowerShellId = frame.PowershellId.ToByteArray()
                 };
@@ -491,6 +520,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                 destination = 0;
                 dataType = 0;
+                payloadEncoding = PSHostGrpcPayloadEncoding.Protobuf;
                 runspacePoolId = Array.Empty<byte>();
                 powerShellId = Array.Empty<byte>();
                 protoPayloadBytes = Array.Empty<byte>();
@@ -507,6 +537,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             {
                 destination = 0;
                 dataType = 0;
+                payloadEncoding = PSHostGrpcPayloadEncoding.Protobuf;
                 runspacePoolId = Array.Empty<byte>();
                 powerShellId = Array.Empty<byte>();
                 protoPayloadBytes = Array.Empty<byte>();
@@ -516,6 +547,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             _inboundInFlightObjects.Remove(objectId);
             destination = existing.Destination;
             dataType = existing.DataType;
+            payloadEncoding = existing.PayloadEncoding;
             runspacePoolId = existing.RunspacePoolId;
             powerShellId = existing.PowerShellId;
             protoPayloadBytes = existing.PayloadStream.ToArray();
@@ -530,17 +562,20 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 out ulong objectId,
                 out uint destination,
                 out uint dataType,
+                out PSHostGrpcPayloadEncoding payloadEncoding,
                 out byte[] runspacePoolId,
                 out byte[] powerShellId,
-                out byte[] protoPayloadBytes))
+                out byte[] binaryPayloadBytes))
             {
                 return null;
             }
 
             byte[] clixmlPayloadBytes;
-            if (protoPayloadBytes.Length > 0)
+            if (binaryPayloadBytes.Length > 0)
             {
-                object? psObj = DeserializeProtoRemotingPayload(protoPayloadBytes);
+                object? psObj = payloadEncoding == PSHostGrpcPayloadEncoding.Cbor
+                    ? DeserializeCborRemotingPayload(binaryPayloadBytes)
+                    : DeserializeProtoRemotingPayload(binaryPayloadBytes);
                 clixmlPayloadBytes = SerializeClixmlRemotingPayload(psObj);
             }
             else
@@ -622,6 +657,31 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 options: DeserializationOptions.RemotingOptions,
                 cryptoHelper: null);
             var deserializer = new ProtoDeserializer(ms, context);
+            object? result = deserializer.Deserialize();
+            deserializer.Done();
+            return result == null ? null : PSObject.AsPSObject(result);
+        }
+
+        internal static byte[] SerializeCborRemotingPayload(object? obj)
+        {
+            using var ms = new MemoryStream();
+            var context = new SerializationContext(
+                depth: 1,
+                options: SerializationOptions.RemotingOptions,
+                cryptoHelper: null);
+            var serializer = new CborSerializer(ms, context);
+            serializer.Serialize(obj!);
+            serializer.Done();
+            return ms.ToArray();
+        }
+
+        internal static object? DeserializeCborRemotingPayload(byte[] cborBytes)
+        {
+            using var ms = new MemoryStream(cborBytes, writable: false);
+            var context = new DeserializationContext(
+                options: DeserializationOptions.RemotingOptions,
+                cryptoHelper: null);
+            var deserializer = new CborDeserializer(ms, context);
             object? result = deserializer.Deserialize();
             deserializer.Done();
             return result == null ? null : PSObject.AsPSObject(result);

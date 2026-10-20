@@ -20,6 +20,12 @@ message PSHostGrpcFrame {
   uint32 data_type = 9;
   bytes runspace_pool_id = 10;
   bytes powershell_id = 11;
+  PSHostGrpcPayloadEncoding payload_encoding = 12;
+}
+
+enum PSHostGrpcPayloadEncoding {
+  Protobuf = 0;
+  Cbor = 1;
 }
 
 enum PSHostGrpcFrameKind {

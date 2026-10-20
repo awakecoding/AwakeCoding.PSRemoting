@@ -25,6 +25,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         public bool AllowUnencrypted { get; private set; }
 
+        public PSHostGrpcEncoding Encoding { get; private set; }
+
         public string GrpcUri
         {
             get
@@ -41,11 +43,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
             bool useSecureConnection,
             bool allowUnencrypted,
             int maxConnections,
-            int drainTimeout)
+            int drainTimeout,
+            PSHostGrpcEncoding encoding = PSHostGrpcEncoding.Protobuf)
             : base(name, port, listenAddress, maxConnections, drainTimeout)
         {
             UseSecureConnection = useSecureConnection;
             AllowUnencrypted = allowUnencrypted;
+            Encoding = encoding;
         }
 
         public override void StartListenerAsync()
@@ -301,8 +305,22 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     var clientAddress = context.Peer ?? "grpc-client";
                     _owner.AddConnection(new ConnectionDetails(connectionId, clientAddress, process.Id));
 
-                    Task inputTask = ProxyGrpcToProcessAsync(requestStream, process.StandardInput.BaseStream, linkedCts.Token);
-                    Task outputTask = ProxyProcessOutputToGrpcAsync(process.StandardOutput.BaseStream, responseStream, writeLock, linkedCts.Token);
+                    PSHostGrpcEncoding connectionEncoding = ResolveConnectionEncoding(context, _owner.Encoding);
+                    bool clientRequestedEncoding = HasExplicitEncodingHeader(context);
+                    var outboundCodec = new PSHostGrpcPsrpCodec(connectionEncoding);
+
+                    Task inputTask = ProxyGrpcToProcessAsync(
+                        requestStream,
+                        process.StandardInput.BaseStream,
+                        outboundCodec,
+                        clientRequestedEncoding,
+                        linkedCts.Token);
+                    Task outputTask = ProxyProcessOutputToGrpcAsync(
+                        process.StandardOutput.BaseStream,
+                        responseStream,
+                        outboundCodec,
+                        writeLock,
+                        linkedCts.Token);
                     Task errorTask = ProxyProcessErrorToGrpcAsync(process.StandardError.BaseStream, responseStream, writeLock, linkedCts.Token);
 
                     await Task.WhenAny(inputTask, outputTask, errorTask).ConfigureAwait(false);
@@ -335,9 +353,34 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 }
             }
 
+            private static bool HasExplicitEncodingHeader(ServerCallContext context)
+            {
+                return context.RequestHeaders.Any(e => e.Key.Equals("x-psremoting-encoding", StringComparison.OrdinalIgnoreCase));
+            }
+
+            private static PSHostGrpcEncoding ResolveConnectionEncoding(ServerCallContext context, PSHostGrpcEncoding defaultEncoding)
+            {
+                var entry = context.RequestHeaders.FirstOrDefault(e => e.Key.Equals("x-psremoting-encoding", StringComparison.OrdinalIgnoreCase));
+                if (entry != null)
+                {
+                    if (entry.Value.Equals("cbor", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return PSHostGrpcEncoding.Cbor;
+                    }
+                    if (entry.Value.Equals("protobuf", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return PSHostGrpcEncoding.Protobuf;
+                    }
+                }
+
+                return defaultEncoding;
+            }
+
             private static async Task ProxyGrpcToProcessAsync(
                 IAsyncStreamReader<PSHostGrpcFrame> requestStream,
                 Stream destination,
+                PSHostGrpcPsrpCodec outboundCodec,
+                bool clientRequestedEncoding,
                 CancellationToken cancellationToken)
             {
                 var inboundCodec = new PSHostGrpcPsrpCodec();
@@ -354,6 +397,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
                         break;
                     }
 
+                    if (frame.Kind == PSHostGrpcFrameKind.Data && clientRequestedEncoding)
+                    {
+                        outboundCodec.Encoding = frame.PayloadEncoding == PSHostGrpcPayloadEncoding.Cbor
+                            ? PSHostGrpcEncoding.Cbor
+                            : PSHostGrpcEncoding.Protobuf;
+                    }
+
                     string? packetLine = inboundCodec.DecodeFrameToPacketLine(frame);
                     if (!string.IsNullOrEmpty(packetLine))
                     {
@@ -366,10 +416,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
             private static async Task ProxyProcessOutputToGrpcAsync(
                 Stream source,
                 IServerStreamWriter<PSHostGrpcFrame> responseStream,
+                PSHostGrpcPsrpCodec outboundCodec,
                 SemaphoreSlim writeLock,
                 CancellationToken cancellationToken)
             {
-                var outboundCodec = new PSHostGrpcPsrpCodec();
                 using var reader = new StreamReader(source, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: false, BufferSize, leaveOpen: true);
 
                 while (true)
