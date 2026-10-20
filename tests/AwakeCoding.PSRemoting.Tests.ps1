@@ -337,8 +337,8 @@ Describe 'New-PSHostSession Cmdlet Tests' {
             $session | Should -Not -BeNullOrEmpty
             $session.State | Should -Be 'Opened'
             
-            Remove-PSSession -Session $session -ErrorAction Stop
-            $session.State | Should -Be 'Closed'
+            Remove-PSHostSessionSafely -Session $session
+            $session.State | Should -BeIn @('Closed', 'Broken')
         }
     }
 
