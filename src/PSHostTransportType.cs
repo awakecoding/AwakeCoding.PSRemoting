@@ -30,4 +30,25 @@ namespace AwakeCoding.PSRemoting.PowerShell
         /// </summary>
         Grpc
     }
+
+    /// <summary>
+    /// PSObject payload encoding mode for the gRPC transport.
+    /// </summary>
+    public enum PSHostGrpcEncoding
+    {
+        /// <summary>
+        /// Protobuf v3 PSObject encoding (PSProtoSerializer).
+        /// </summary>
+        Protobuf = 0,
+
+        /// <summary>
+        /// CBOR RFC 8949 PSObject encoding (PSCborSerializer).
+        /// </summary>
+        Cbor = 1,
+
+        /// <summary>
+        /// CLIXML UTF-8 PSObject encoding (System.Management.Automation.Serializer).
+        /// </summary>
+        Clixml = 2
+    }
 }

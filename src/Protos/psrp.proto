@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+option csharp_namespace = "AwakeCoding.PSRemoting.PowerShell.Grpc";
+
+package awakecoding.psremoting.psrp;
+
+service PsrpTransport {
+  rpc Connect(stream PsrpPacket) returns (stream PsrpPacket);
+}
+
+// Transport packet carrying either an OutOfProcess control packet or an
+// [MS-PSRP] Section 2.2.4 Packet Fragment + Section 2.2.1 PSRP Message header.
+message PsrpPacket {
+  PsrpPacketType packet_type = 1;
+  bytes data = 2;                                      // [MS-PSRP] 2.2.1 Data / 2.2.4 Blob
+  string ps_guid = 3;                                  // OutOfProcess PSGuid attribute
+  string stream = 4;                                   // OutOfProcess Stream attribute (Default / PromptResponse)
+  uint64 object_id = 5;                                // [MS-PSRP] 2.2.4 ObjectId
+  uint64 fragment_id = 6;                              // [MS-PSRP] 2.2.4 FragmentId
+  uint32 fragment_flags = 7;                           // [MS-PSRP] 2.2.4 S (0x01) / E (0x02) flags
+  PsrpDestination destination = 8;                     // [MS-PSRP] 2.2.1 Destination
+  PsrpMessageType message_type = 9;                    // [MS-PSRP] 2.2.1 MessageType
+  bytes rpid = 10;                                     // [MS-PSRP] 2.2.1 RPID (RunspacePool ID, 16-byte GUID)
+  bytes pid = 11;                                      // [MS-PSRP] 2.2.1 PID (Pipeline ID, 16-byte GUID)
+  PsrpSerializationFormat serialization_format = 12;   // [MS-PSRP] 2.2.5 Serialization format
+}
+
+// [MS-PSRP] Section 2.2.5 Serialization format for PsrpPacket.data.
+enum PsrpSerializationFormat {
+  Protobuf = 0;
+  Cbor = 1;
+  Clixml = 2;
+}
+
+// OutOfProcess transport packet types.
+enum PsrpPacketType {
+  Input = 0;
+  Output = 1;
+  Error = 2;
+  Close = 3;
+  Data = 4;
+  DataAck = 5;
+  Command = 6;
+  CommandAck = 7;
+  ClosePacket = 8;
+  CloseAck = 9;
+  Signal = 10;
+  SignalAck = 11;
+}
+
+// [MS-PSRP] Section 2.2.1 Destination.
+enum PsrpDestination {
+  DestinationUnspecified = 0;
+  Client = 1;
+  Server = 2;
+}
+
+// [MS-PSRP] Section 2.2.1 MessageType.
+enum PsrpMessageType {
+  MessageTypeUnspecified = 0;
+  SessionCapability = 0x00010002;
+  InitRunspacePool = 0x00010004;
+  PublicKey = 0x00010005;
+  EncryptedSessionKey = 0x00010006;
+  PublicKeyRequest = 0x00010007;
+  ConnectRunspacePool = 0x00010008;
+  SetMaxRunspaces = 0x00021002;
+  SetMinRunspaces = 0x00021003;
+  RunspaceAvailability = 0x00021004;
+  RunspacePoolState = 0x00021005;
+  CreatePipeline = 0x00021006;
+  GetAvailableRunspaces = 0x00021007;
+  UserEvent = 0x00021008;
+  ApplicationPrivateData = 0x00021009;
+  GetCommandMetadata = 0x0002100A;
+  RunspacePoolInitData = 0x0002100B;
+  ResetRunspaceState = 0x0002100C;
+  RunspacePoolHostCall = 0x00021100;
+  RunspacePoolHostResponse = 0x00021101;
+  PipelineInput = 0x00041002;
+  EndOfPipelineInput = 0x00041003;
+  PipelineOutput = 0x00041004;
+  ErrorRecord = 0x00041005;
+  PipelineState = 0x00041006;
+  DebugRecord = 0x00041007;
+  VerboseRecord = 0x00041008;
+  WarningRecord = 0x00041009;
+  ProgressRecord = 0x00041010;
+  InformationRecord = 0x00041011;
+  PipelineHostCall = 0x00041100;
+  PipelineHostResponse = 0x00041101;
+}
+
+// [MS-PSRP] Section 2.2.5 Serialization of Primitive Type Objects (2.2.5.1)
+// and Complex Objects (2.2.5.2), used inside PsrpPacket.data after the 4-byte "PSPB" header.
+message PsrpObject {
+  string property_name = 1;                // [MS-PSRP] 2.2.5.3.1 Property Name (N)
+  bool null_value = 2;                     // [MS-PSRP] 2.2.5.1.20 Null Value (<Nil>)
+  bool boolean_value = 3;                  // [MS-PSRP] 2.2.5.1.3 Boolean (<B>)
+  string string_value = 4;                 // [MS-PSRP] 2.2.5.1.1 String (<S>)
+  sint32 signed_int = 5;                   // [MS-PSRP] 2.2.5.1.11 Signed Int (<I32>)
+  sint64 signed_long = 6;                  // [MS-PSRP] 2.2.5.1.13 Signed Long (<I64>)
+  uint64 unsigned_long = 7;                // [MS-PSRP] 2.2.5.1.12 Unsigned Long (<U64>)
+  double double_value = 8;                 // [MS-PSRP] 2.2.5.1.15 Double (<Db>)
+  bytes byte_array = 9;                    // [MS-PSRP] 2.2.5.1.17 Array of Bytes (<BA>)
+  bytes guid = 10;                         // [MS-PSRP] 2.2.5.1.18 GUID (<G>)
+  fixed64 date_time = 11;                  // [MS-PSRP] 2.2.5.1.4 Date/Time (<DT>)
+  sint64 duration = 12;                    // [MS-PSRP] 2.2.5.1.5 Duration (<TS>)
+  string object_ref = 13;                  // [MS-PSRP] 2.2.5.2.1.2 <Ref> Element
+  PsrpComplexObject complex_object = 14;   // [MS-PSRP] 2.2.5.2.2 <Obj> Element
+  uint32 unsigned_int = 15;                // [MS-PSRP] 2.2.5.1.10 Unsigned Int (<U32>)
+  uint32 unsigned_byte = 16;               // [MS-PSRP] 2.2.5.1.6 Unsigned Byte (<By>)
+  sint32 signed_byte = 17;                 // [MS-PSRP] 2.2.5.1.7 Signed Byte (<SB>)
+  sint32 signed_short = 18;                // [MS-PSRP] 2.2.5.1.9 Signed Short (<I16>)
+  uint32 unsigned_short = 19;              // [MS-PSRP] 2.2.5.1.8 Unsigned Short (<U16>)
+  uint32 character = 20;                   // [MS-PSRP] 2.2.5.1.2 Character (<C>)
+  float float_value = 21;                  // [MS-PSRP] 2.2.5.1.14 Float (<Sg>)
+  bytes decimal_value = 22;                // [MS-PSRP] 2.2.5.1.16 Decimal (<D>)
+  string uri = 23;                         // [MS-PSRP] 2.2.5.1.19 URI (<URI>)
+  string version = 24;                     // [MS-PSRP] 2.2.5.1.21 Version (<Version>)
+  string script_block = 25;                // [MS-PSRP] 2.2.5.1.23 ScriptBlock (<SBK>)
+  string xml_document = 26;                // [MS-PSRP] 2.2.5.1.22 XML Document (<XD>)
+  PsrpProgressRecord progress_record = 27; // [MS-PSRP] 2.2.5.1.25 Progress Record (<PR>)
+  string secure_string = 28;               // [MS-PSRP] 2.2.5.1.24 Secure String (<SS>)
+  string stream_name = 29;                 // Stream Name (S)
+}
+
+// [MS-PSRP] Section 2.2.5.2.2 <Obj> Element.
+message PsrpComplexObject {
+  string ref_id = 1;                                    // [MS-PSRP] 2.2.5.2.1.1 RefId Attribute
+  PsrpTypeNames type_names = 2;                         // [MS-PSRP] 2.2.5.2.3 Type Names (<TN>)
+  string type_names_ref = 3;                            // [MS-PSRP] 2.2.5.2.3 Type Names Reference (<TNRef>)
+  string to_string_value = 4;                           // [MS-PSRP] 2.2.5.2.4 ToString (<ToString>)
+  PsrpObject extended_primitive = 5;                    // [MS-PSRP] 2.2.5.2.5 Extended Primitive / 2.2.5.2.7 Enums
+  PsrpContainerType container_type = 6;                 // [MS-PSRP] 2.2.5.2.6 Contents of Known Containers
+  repeated PsrpObject container_elements = 7;           // [MS-PSRP] 2.2.5.2.6.1-3 Stack/Queue/List elements
+  repeated PsrpDictionaryEntry dictionary_entries = 8;  // [MS-PSRP] 2.2.5.2.6.4 Dictionaries (<DCT>/<En>)
+  repeated PsrpObject adapted_properties = 9;           // [MS-PSRP] 2.2.5.2.8 Adapted Properties (<Props>)
+  repeated PsrpObject extended_properties = 10;         // [MS-PSRP] 2.2.5.2.9 Extended Properties (<MS>)
+  repeated PsrpPropertySet property_sets = 11;          // [MS-PSRP] 2.2.5.3.4.3 Property Sets (<MS N="...">)
+}
+
+// [MS-PSRP] Section 2.2.5.2.6 Known Container types.
+enum PsrpContainerType {
+  ContainerNone = 0;
+  Dictionary = 1;   // <DCT>
+  Queue = 2;        // <QUE>
+  Stack = 3;        // <STK>
+  List = 4;         // <LST>
+  Enumerable = 5;   // <IE>
+}
+
+// [MS-PSRP] Section 2.2.5.2.3 Type Names (<TN>).
+message PsrpTypeNames {
+  string ref_id = 1;
+  repeated string types = 2; // <T>
+}
+
+// [MS-PSRP] Section 2.2.5.2.6.4 Dictionary entry (<En>).
+message PsrpDictionaryEntry {
+  PsrpObject key = 1;
+  PsrpObject value = 2;
+}
+
+// [MS-PSRP] Section 2.2.5.3.4.3 Property Set (<MS N="...">).
+message PsrpPropertySet {
+  string name = 1;
+  repeated PsrpObject extended_properties = 2;
+  repeated PsrpPropertySet property_sets = 3;
+}
+
+// [MS-PSRP] Section 2.2.5.1.25 Progress Record (<PR>).
+message PsrpProgressRecord {
+  string activity = 1;
+  sint32 activity_id = 2;
+  PsrpObject current_operation = 3;
+  sint32 parent_activity_id = 4;
+  sint32 percent_complete = 5;
+  uint32 record_type = 6;
+  sint32 seconds_remaining = 7;
+  string status_description = 8;
+}
+
+

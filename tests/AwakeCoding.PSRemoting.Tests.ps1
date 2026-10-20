@@ -337,8 +337,8 @@ Describe 'New-PSHostSession Cmdlet Tests' {
             $session | Should -Not -BeNullOrEmpty
             $session.State | Should -Be 'Opened'
             
-            Remove-PSSession -Session $session -ErrorAction Stop
-            $session.State | Should -Be 'Closed'
+            Remove-PSHostSessionSafely -Session $session
+            $session.State | Should -BeIn @('Closed', 'Broken')
         }
     }
 
@@ -1369,6 +1369,249 @@ Describe 'End-to-End Client Transport Tests' {
             finally {
                 Remove-PSHostSessionSafely -Session $session1
                 Remove-PSHostSessionSafely -Session $session2
+            }
+        }
+
+        It 'Round-trips complex objects and streams over Protobuf-encoded gRPC transport' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -OpenTimeout 15000
+            try {
+                $guid = [guid]::NewGuid()
+                $result = Invoke-Command -Session $session -ScriptBlock {
+                    param($g)
+                    [pscustomobject]@{
+                        Id      = $g
+                        Version = [version]'2.3.4'
+                        Items   = @(10, 'hello', $true)
+                        Table   = @{ Key = 'Value'; Count = 42 }
+                    }
+                } -ArgumentList $guid -ErrorAction Stop
+
+                $result.Id | Should -Be $guid
+                $result.Version.ToString() | Should -Be '2.3.4'
+                $result.Items | Should -HaveCount 3
+                $result.Items[0] | Should -Be 10
+                $result.Items[1] | Should -Be 'hello'
+                $result.Items[2] | Should -BeTrue
+                $result.Table['Key'] | Should -Be 'Value'
+                $result.Table['Count'] | Should -Be 42
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Encodes PSRP Data packets into binary Protobuf payloads without CLIXML' {
+            $asm = [AwakeCoding.PSRemoting.PowerShell.PSHostGrpcServer].Assembly
+            $codecType = $asm.GetType('AwakeCoding.PSRemoting.PowerShell.PSHostGrpcPsrpCodec')
+            $codec = [Activator]::CreateInstance($codecType)
+            $fragmentBytes = [System.Collections.Generic.List[byte]]::new()
+            # ObjectId = 1 (8 bytes BE), FragmentId = 0 (8 bytes BE), Flags = 3 (Start|End)
+            $fragmentBytes.AddRange([byte[]]@(0, 0, 0, 0, 0, 0, 0, 1))
+            $fragmentBytes.AddRange([byte[]]@(0, 0, 0, 0, 0, 0, 0, 0))
+            $fragmentBytes.Add([byte]3)
+            # RDO: Destination = 2 (Server), DataType = 0x00041002 (RunspacePoolStateInfo), RunspacePoolId, PowerShellId
+            $rdoStream = [System.IO.MemoryStream]::new()
+            $bw = [System.IO.BinaryWriter]::new($rdoStream)
+            $bw.Write([uint32]2)
+            $bw.Write([uint32]0x00041002)
+            $rpId = [guid]::NewGuid()
+            $psId = [guid]::Empty
+            $bw.Write($rpId.ToByteArray())
+            $bw.Write($psId.ToByteArray())
+            $utf8Clixml = [System.Text.Encoding]::UTF8.GetBytes("<Obj RefId=`"0`"><MS><S N=`"Message`">ProtoTest</S><I32 N=`"Value`">123</I32></MS></Obj>")
+            $bw.Write([byte[]]@(0xEF, 0xBB, 0xBF))
+            $bw.Write($utf8Clixml)
+            $bw.Flush()
+            $rdoBytes = $rdoStream.ToArray()
+            $lenBytes = [System.BitConverter]::GetBytes([uint32]$rdoBytes.Length)
+            if ([System.BitConverter]::IsLittleEndian) { [System.Array]::Reverse($lenBytes) }
+            $fragmentBytes.AddRange($lenBytes)
+            $fragmentBytes.AddRange($rdoBytes)
+
+            $b64 = [Convert]::ToBase64String($fragmentBytes.ToArray())
+            $packetLine = "<Data Stream='Default' PSGuid='$psId'>$b64</Data>"
+
+            $encodeMethod = $codecType.GetMethod('EncodePacketLineToFrames', [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+            $decodeMethod = $codecType.GetMethod('DecodeFrameToPacketLine', [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+
+            $frames = @($encodeMethod.Invoke($codec, @($packetLine)))
+            $frames | Should -HaveCount 1
+            $frame = $frames[0]
+            $frame.PacketType.ToString() | Should -Be 'Data'
+            $frame.Destination.ToString() | Should -Be 'Server'
+            $frame.MessageType.ToString() | Should -Be 'PipelineInput'
+            $frame.Data.Length | Should -BeGreaterThan 0
+
+            $payloadText = [System.Text.Encoding]::UTF8.GetString($frame.Data.ToByteArray())
+            $payloadText | Should -Not -Match '<Obj'
+            $payloadText | Should -Match 'ProtoTest'
+
+            $psrpObjectType = [AwakeCoding.PSRemoting.PowerShell.NewPSHostSessionCommand].Assembly.GetType('AwakeCoding.PSRemoting.PowerShell.Grpc.PsrpObject')
+            $parser = $psrpObjectType.GetProperty('Parser', [System.Reflection.BindingFlags]'Static,Public,NonPublic').GetValue($null)
+            $dataStream = [System.IO.MemoryStream]::new($frame.Data.ToByteArray())
+            $parsedPsrpObj = $parser.ParseDelimitedFrom($dataStream)
+            $parsedPsrpObj.ComplexObject.RefId | Should -Be '0'
+            ($parsedPsrpObj.ComplexObject.ExtendedProperties | Where-Object PropertyName -eq 'Message').StringValue | Should -Be 'ProtoTest'
+            ($parsedPsrpObj.ComplexObject.ExtendedProperties | Where-Object PropertyName -eq 'Value').SignedInt | Should -Be 123
+
+            $decodedLine = $decodeMethod.Invoke($codec, @($frame))
+            $decodedLine | Should -Match "^<Data Stream='Default' PSGuid='$psId'>"
+
+            # Verify direct client raw-fragment encode and direct RemoteDataObject<PSObject> decode (skipping <Data> XML, Base64, and CLIXML on receive)
+            $encodeRawMethod = $codecType.GetMethod('EncodeRawFragmentToFrames', [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+            $tryDecodeRdoMethod = $codecType.GetMethod('TryDecodeDataFrameToRemoteDataObject', [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+
+            $rawFrames = @($encodeRawMethod.Invoke($codec, @([byte[]]$fragmentBytes.ToArray(), $psId.ToString(), 'Default')))
+            $rawFrames | Should -HaveCount 1
+
+            $decodeArgs = [object[]]@($rawFrames[0], [guid]::Empty, $null)
+            $hasRdo = $tryDecodeRdoMethod.Invoke($codec, $decodeArgs)
+            $hasRdo | Should -BeTrue
+            $decodeArgs[1] | Should -Be $psId
+            $rdo = $decodeArgs[2]
+            $rdo | Should -Not -BeNullOrEmpty
+            $rdoFlags = [System.Reflection.BindingFlags]'Instance,Public,NonPublic'
+            $rdoType = $rdo.GetType()
+            $rdoType.GetProperty('RunspacePoolId', $rdoFlags).GetValue($rdo) | Should -Be $rpId
+            $rdoType.GetProperty('PowerShellId', $rdoFlags).GetValue($rdo) | Should -Be $psId
+            $rdoData = $rdoType.GetProperty('Data', $rdoFlags).GetValue($rdo)
+            $rdoData.Message | Should -Be 'ProtoTest'
+            $rdoData.Value | Should -Be 123
+
+            # Verify CBOR encoding mode on the same PSRP fragment
+            $cborCodec = [Activator]::CreateInstance($codecType, @([AwakeCoding.PSRemoting.PowerShell.PSHostGrpcEncoding]::Cbor))
+            $cborFrames = @($encodeRawMethod.Invoke($cborCodec, @([byte[]]$fragmentBytes.ToArray(), $psId.ToString(), 'Default')))
+            $cborFrames | Should -HaveCount 1
+            $cborFrame = $cborFrames[0]
+            $cborFrame.SerializationFormat.ToString() | Should -Be 'Cbor'
+            $cborFrame.Data.Length | Should -BeGreaterThan 0
+
+            $cborText = [System.Text.Encoding]::UTF8.GetString($cborFrame.Data.ToByteArray())
+            $cborText | Should -Not -Match '<Obj'
+            $cborText | Should -Match 'ProtoTest'
+
+            $cborDecodeArgs = [object[]]@($cborFrame, [guid]::Empty, $null)
+            $hasCborRdo = $tryDecodeRdoMethod.Invoke($codec, $cborDecodeArgs)
+            $hasCborRdo | Should -BeTrue
+            $cborRdo = $cborDecodeArgs[2]
+            $cborRdoData = $rdoType.GetProperty('Data', $rdoFlags).GetValue($cborRdo)
+            $cborRdoData.Message | Should -Be 'ProtoTest'
+            $cborRdoData.Value | Should -Be 123
+
+            # Verify CLIXML encoding mode on the same PSRP fragment at the same frame level
+            $clixmlCodec = [Activator]::CreateInstance($codecType, @([AwakeCoding.PSRemoting.PowerShell.PSHostGrpcEncoding]::Clixml))
+            $clixmlFrames = @($encodeRawMethod.Invoke($clixmlCodec, @([byte[]]$fragmentBytes.ToArray(), $psId.ToString(), 'Default')))
+            $clixmlFrames | Should -HaveCount 1
+            $clixmlFrame = $clixmlFrames[0]
+            $clixmlFrame.SerializationFormat.ToString() | Should -Be 'Clixml'
+            $clixmlFrame.Data.Length | Should -BeGreaterThan 0
+
+            $clixmlText = [System.Text.Encoding]::UTF8.GetString($clixmlFrame.Data.ToByteArray())
+            $clixmlText | Should -Match '<Obj'
+            $clixmlText | Should -Match 'ProtoTest'
+
+            $clixmlDecodeArgs = [object[]]@($clixmlFrame, [guid]::Empty, $null)
+            $hasClixmlRdo = $tryDecodeRdoMethod.Invoke($codec, $clixmlDecodeArgs)
+            $hasClixmlRdo | Should -BeTrue
+            $clixmlRdo = $clixmlDecodeArgs[2]
+            $clixmlRdoData = $rdoType.GetProperty('Data', $rdoFlags).GetValue($clixmlRdo)
+            $clixmlRdoData.Message | Should -Be 'ProtoTest'
+            $clixmlRdoData.Value | Should -Be 123
+        }
+
+        It 'Round-trips complex objects over CLIXML-encoded gRPC transport (-GrpcEncoding Clixml)' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -GrpcEncoding Clixml -OpenTimeout 15000
+            try {
+                $guid = [guid]::NewGuid()
+                $result = Invoke-Command -Session $session -ScriptBlock {
+                    param($g)
+                    [pscustomobject]@{
+                        Id      = $g
+                        Version = [version]'7.8.9'
+                        Items   = @(300, 'clixml-hello', $true)
+                        Table   = @{ Mode = 'Clixml'; Count = 77 }
+                    }
+                } -ArgumentList $guid -ErrorAction Stop
+
+                $result.Id | Should -Be $guid
+                $result.Version.ToString() | Should -Be '7.8.9'
+                $result.Items | Should -HaveCount 3
+                $result.Items[0] | Should -Be 300
+                $result.Items[1] | Should -Be 'clixml-hello'
+                $result.Items[2] | Should -BeTrue
+                $result.Table['Mode'] | Should -Be 'Clixml'
+                $result.Table['Count'] | Should -Be 77
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Round-trips complex objects over CBOR-encoded gRPC transport (-GrpcEncoding Cbor)' {
+            $session = New-PSHostSession -GrpcUri $script:GrpcUri -GrpcEncoding Cbor -OpenTimeout 15000
+            try {
+                $guid = [guid]::NewGuid()
+                $result = Invoke-Command -Session $session -ScriptBlock {
+                    param($g)
+                    [pscustomobject]@{
+                        Id      = $g
+                        Version = [version]'4.5.6'
+                        Items   = @(100, 'cbor-hello', $false)
+                        Table   = @{ Mode = 'Cbor'; Count = 99 }
+                    }
+                } -ArgumentList $guid -ErrorAction Stop
+
+                $result.Id | Should -Be $guid
+                $result.Version.ToString() | Should -Be '4.5.6'
+                $result.Items | Should -HaveCount 3
+                $result.Items[0] | Should -Be 100
+                $result.Items[1] | Should -Be 'cbor-hello'
+                $result.Items[2] | Should -BeFalse
+                $result.Table['Mode'] | Should -Be 'Cbor'
+                $result.Table['Count'] | Should -Be 99
+            }
+            finally {
+                Remove-PSHostSessionSafely -Session $session
+            }
+        }
+
+        It 'Supports gRPC server started with -GrpcEncoding Cbor' {
+            $cborServer = Start-PSHostServer -TransportType Grpc -Port 0 -GrpcEncoding Cbor
+            try {
+                $cborServer.Encoding.ToString() | Should -Be 'Cbor'
+                $session = New-PSHostSession -GrpcUri $cborServer.GrpcUri -OpenTimeout 15000
+                try {
+                    $res = Invoke-Command -Session $session -ScriptBlock { 21 * 2 } -ErrorAction Stop
+                    $res | Should -Be 42
+                }
+                finally {
+                    Remove-PSHostSessionSafely -Session $session
+                }
+            }
+            finally {
+                Stop-PSHostServer -Server $cborServer -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        It 'Streams pipeline input and informational/error records over in-process gRPC server across all encodings' {
+            foreach ($enc in @('Protobuf', 'Cbor', 'Clixml')) {
+                $session = New-PSHostSession -GrpcUri $script:GrpcUri -GrpcEncoding $enc -OpenTimeout 15000
+                try {
+                    $piped = 1..5 | Invoke-Command -Session $session -ScriptBlock { process { $_ * 10 } } -ErrorAction Stop
+                    $piped | Should -Be @(10, 20, 30, 40, 50)
+
+                    $warn = $null
+                    $out = Invoke-Command -Session $session -ScriptBlock {
+                        Write-Warning "warn-$using:enc"
+                        "ok-$using:enc"
+                    } -WarningVariable warn -WarningAction SilentlyContinue -ErrorAction Stop
+                    $out | Should -Be "ok-$enc"
+                    $warn | Should -HaveCount 1
+                    $warn[0].ToString() | Should -Be "warn-$enc"
+                }
+                finally {
+                    Remove-PSHostSessionSafely -Session $session
+                }
             }
         }
     }

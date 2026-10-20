@@ -115,8 +115,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         private void ErrorDataReceived(object? sender, DataReceivedEventArgs args)
         {
-            // Guard against race conditions during close
-            if (_isClosed) return;
+            // Guard against race conditions during close or EOF (args.Data == null)
+            if (_isClosed || string.IsNullOrEmpty(args.Data)) return;
             HandleErrorDataReceived(args.Data);
         }
 
@@ -124,7 +124,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             // Guard against race conditions during close - but we need to allow
             // the CloseAck packet through, so only check after initial processing
-            if (_isClosed) return;
+            if (_isClosed || string.IsNullOrEmpty(args.Data)) return;
             HandleOutputDataReceived(args.Data);
         }
 

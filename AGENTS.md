@@ -44,7 +44,7 @@ This is a **hybrid .NET/PowerShell module** that provides PowerShell remoting ca
 - [`src/PowerShellFinder.cs`](src/PowerShellFinder.cs) - Utilities to locate PowerShell executables and generate pipe names
 - [`src/PSHostTcpServerTransport.cs`](src/PSHostTcpServerTransport.cs) - Internal TCP transport connection info and manager (server-side)
 - [`src/PSHostGrpcPlatform.cs`](src/PSHostGrpcPlatform.cs) - gRPC platform support guard
-- [`src/Protos/pshostgrpc.proto`](src/Protos/pshostgrpc.proto) - gRPC transport service contract
+- [`src/Protos/psrp.proto`](src/Protos/psrp.proto) - gRPC transport service contract
 - [`src/WinRMSspiAuth.cs`](src/WinRMSspiAuth.cs) - WinRM SSPI authentication helpers
 - [`src/AwakeCoding.PSRemoting.psd1`](src/AwakeCoding.PSRemoting.psd1) - Module manifest
 

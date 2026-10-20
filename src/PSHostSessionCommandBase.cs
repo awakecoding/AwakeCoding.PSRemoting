@@ -233,6 +233,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
         [ValidateNotNullOrEmpty()]
         public Uri? GrpcUri { get; set; }
 
+        /// <summary>
+        /// PSObject payload encoding mode for the gRPC transport (Protobuf or Cbor).
+        /// </summary>
+        [Parameter(ParameterSetName = GrpcParameterSet)]
+        [Alias("Encoding")]
+        public PSHostGrpcEncoding GrpcEncoding { get; set; } = PSHostGrpcEncoding.Protobuf;
+
         #endregion
 
         #region NamedPipe Parameters
@@ -485,7 +492,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
             return new PSHostGrpcClientInfo(GrpcUri)
             {
-                OpenTimeout = OpenTimeout
+                OpenTimeout = OpenTimeout,
+                Encoding = GrpcEncoding,
+                HasExplicitEncoding = MyInvocation.BoundParameters.ContainsKey(nameof(GrpcEncoding))
             };
         }
 

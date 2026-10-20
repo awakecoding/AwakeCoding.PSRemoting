@@ -229,9 +229,13 @@ The `New-PSHostSession` and `Enter-PSHostSession` cmdlets support gRPC endpoints
 # Start a loopback plaintext gRPC server on an automatically assigned port
 $server = Start-PSHostServer -TransportType Grpc -Port 0
 
-# Connect to the server from this or another PowerShell process
+# Connect to the server from this or another PowerShell process (defaults to Protobuf PSObject encoding)
 $session = New-PSHostSession -GrpcUri $server.GrpcUri
 Invoke-Command -Session $session { $PSVersionTable.PSVersion }
+
+# Use CBOR or CLIXML PSObject encoding instead of Protobuf
+$cborSession = New-PSHostSession -GrpcUri $server.GrpcUri -GrpcEncoding Cbor
+$clixmlSession = New-PSHostSession -GrpcUri $server.GrpcUri -GrpcEncoding Clixml
 
 # Enter the session interactively
 Enter-PSHostSession -GrpcUri $server.GrpcUri

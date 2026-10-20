@@ -9,7 +9,7 @@
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <FileVersion>1.0.0.0</FileVersion>
     <TargetFrameworks>net8.0</TargetFrameworks>
-    <LangVersion>10.0</LangVersion>
+    <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
@@ -28,7 +28,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Protobuf Include="Protos\pshostgrpc.proto" GrpcServices="Both" />
+    <Protobuf Include="Protos\psrp.proto" GrpcServices="Both" Access="Internal" />
   </ItemGroup>
 
 </Project>
