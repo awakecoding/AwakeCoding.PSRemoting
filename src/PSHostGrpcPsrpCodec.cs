@@ -99,6 +99,37 @@ namespace AwakeCoding.PSRemoting.PowerShell
             Type.EmptyTypes,
             modifiers: null);
 
+        private static readonly Type? s_baseClientTransportManagerType = typeof(PSObject).Assembly.GetType(
+            "System.Management.Automation.Remoting.Client.BaseClientTransportManager");
+
+        private static readonly MethodInfo? s_onDataAvailableHandlerMethod = s_baseClientTransportManagerType?.GetMethod(
+            "OnDataAvailableHandler",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly Type? s_remoteDataObjectOfPSObjectType = s_onDataAvailableHandlerMethod?.GetParameters()[0].ParameterType;
+
+        private static readonly MethodInfo? s_rdoCreateFromMethod = FindRdoCreateFromMethod();
+        private static readonly Type? s_remotingDestinationType = s_rdoCreateFromMethod?.GetParameters()[0].ParameterType;
+        private static readonly Type? s_remotingDataTypeType = s_rdoCreateFromMethod?.GetParameters()[1].ParameterType;
+
+        private static MethodInfo? FindRdoCreateFromMethod()
+        {
+            if (s_remoteDataObjectOfPSObjectType == null)
+            {
+                return null;
+            }
+
+            foreach (var method in s_remoteDataObjectOfPSObjectType.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic))
+            {
+                if (method.Name == "CreateFrom" && method.GetParameters().Length == 5)
+                {
+                    return method;
+                }
+            }
+
+            return null;
+        }
+
         private readonly Dictionary<ulong, MemoryStream> _outboundInFlightObjects = new Dictionary<ulong, MemoryStream>();
         private readonly Dictionary<ulong, ReassemblyBuffer> _inboundInFlightObjects = new Dictionary<ulong, ReassemblyBuffer>();
 
@@ -176,7 +207,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 case "Data":
                     string base64Content = xmlReader.ReadElementContentAsString();
                     byte[] rawBytes = Convert.FromBase64String(base64Content);
-                    foreach (var frame in EncodeDataBytesToFrames(rawBytes, psGuid, streamAttr))
+                    foreach (var frame in EncodeRawFragmentToFrames(rawBytes, psGuid, streamAttr))
                     {
                         yield return frame;
                     }
@@ -187,7 +218,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
         }
 
-        private IEnumerable<PSHostGrpcFrame> EncodeDataBytesToFrames(byte[] rawBytes, string psGuid, string streamAttr)
+        /// <summary>
+        /// Encodes raw PSRP fragment bytes directly into one or more Protobuf-backed <see cref="PSHostGrpcFrame"/> messages,
+        /// bypassing <c>OutOfProcessUtils.CreateDataPacket</c> XML and Base64 encoding.
+        /// </summary>
+        public IEnumerable<PSHostGrpcFrame> EncodeRawFragmentToFrames(byte[] rawBytes, string psGuid, string streamAttr = "Default")
         {
             int offset = 0;
             while (offset + FragmentHeaderLength <= rawBytes.Length)
@@ -356,18 +391,81 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
         }
 
-        private string? DecodeDataFrameToPacketLine(PSHostGrpcFrame frame)
+        /// <summary>
+        /// Decodes an inbound <see cref="PSHostGrpcFrameKind.Data"/> frame directly into a
+        /// <c>RemoteDataObject&lt;PSObject&gt;</c> using <see cref="ProtoDeserializer"/> without
+        /// re-serializing to CLIXML, Base64, or <c>&lt;Data&gt;</c> XML.
+        /// Returns <c>true</c> when a complete PSRP object has been reassembled and decoded.
+        /// </summary>
+        public bool TryDecodeDataFrameToRemoteDataObject(
+            PSHostGrpcFrame frame,
+            out Guid psGuid,
+            out object? remoteDataObject)
         {
-            ulong objectId = frame.ObjectId;
+            psGuid = ParsePsGuid(frame.PsGuid);
+            remoteDataObject = null;
+
+            if (!TryReassembleInboundDataFrame(
+                frame,
+                out _,
+                out uint destination,
+                out uint dataType,
+                out byte[] runspacePoolId,
+                out byte[] powerShellId,
+                out byte[] protoPayloadBytes))
+            {
+                return false;
+            }
+
+            if (s_rdoCreateFromMethod == null || s_remotingDestinationType == null || s_remotingDataTypeType == null)
+            {
+                throw new InvalidOperationException("Failed to resolve RemoteDataObject<PSObject>.CreateFrom reflection binding.");
+            }
+
+            PSObject? psObj = protoPayloadBytes.Length > 0
+                ? DeserializeProtoRemotingPayload(protoPayloadBytes) as PSObject
+                : null;
+
+            Guid rsPoolGuid = runspacePoolId.Length == 16 ? new Guid(runspacePoolId) : Guid.Empty;
+            Guid psInstanceGuid = powerShellId.Length == 16 ? new Guid(powerShellId) : Guid.Empty;
+
+            remoteDataObject = s_rdoCreateFromMethod.Invoke(
+                obj: null,
+                new object?[]
+                {
+                    Enum.ToObject(s_remotingDestinationType, destination),
+                    Enum.ToObject(s_remotingDataTypeType, dataType),
+                    rsPoolGuid,
+                    psInstanceGuid,
+                    psObj!
+                });
+
+            return remoteDataObject != null;
+        }
+
+        internal static Guid ParsePsGuid(string? psGuidText)
+        {
+            if (string.IsNullOrEmpty(psGuidText))
+            {
+                return Guid.Empty;
+            }
+
+            return Guid.TryParse(psGuidText, out Guid parsed) ? parsed : Guid.Empty;
+        }
+
+        private bool TryReassembleInboundDataFrame(
+            PSHostGrpcFrame frame,
+            out ulong objectId,
+            out uint destination,
+            out uint dataType,
+            out byte[] runspacePoolId,
+            out byte[] powerShellId,
+            out byte[] protoPayloadBytes)
+        {
+            objectId = frame.ObjectId;
             byte flags = (byte)frame.BlobFlags;
             bool isStart = (flags & FragmentFlagStart) != 0;
             bool isEnd = (flags & FragmentFlagEnd) != 0;
-
-            uint destination;
-            uint dataType;
-            byte[] runspacePoolId;
-            byte[] powerShellId;
-            byte[] protoPayloadBytes;
 
             if (isStart && isEnd)
             {
@@ -376,8 +474,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 runspacePoolId = frame.RunspacePoolId.ToByteArray();
                 powerShellId = frame.PowershellId.ToByteArray();
                 protoPayloadBytes = frame.Payload.ToByteArray();
+                return true;
             }
-            else if (isStart)
+
+            if (isStart)
             {
                 var buffer = new ReassemblyBuffer
                 {
@@ -388,28 +488,53 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 };
                 frame.Payload.WriteTo(buffer.PayloadStream);
                 _inboundInFlightObjects[objectId] = buffer;
-                return null;
+
+                destination = 0;
+                dataType = 0;
+                runspacePoolId = Array.Empty<byte>();
+                powerShellId = Array.Empty<byte>();
+                protoPayloadBytes = Array.Empty<byte>();
+                return false;
             }
-            else
+
+            if (!_inboundInFlightObjects.TryGetValue(objectId, out var existing))
             {
-                if (!_inboundInFlightObjects.TryGetValue(objectId, out var buffer))
-                {
-                    throw new PSRemotingTransportException($"Missing start fragment for inbound gRPC PSRP ObjectId {objectId}.");
-                }
+                throw new PSRemotingTransportException($"Missing start fragment for inbound gRPC PSRP ObjectId {objectId}.");
+            }
 
-                frame.Payload.WriteTo(buffer.PayloadStream);
-                if (!isEnd)
-                {
-                    return null;
-                }
+            frame.Payload.WriteTo(existing.PayloadStream);
+            if (!isEnd)
+            {
+                destination = 0;
+                dataType = 0;
+                runspacePoolId = Array.Empty<byte>();
+                powerShellId = Array.Empty<byte>();
+                protoPayloadBytes = Array.Empty<byte>();
+                return false;
+            }
 
-                _inboundInFlightObjects.Remove(objectId);
-                destination = buffer.Destination;
-                dataType = buffer.DataType;
-                runspacePoolId = buffer.RunspacePoolId;
-                powerShellId = buffer.PowerShellId;
-                protoPayloadBytes = buffer.PayloadStream.ToArray();
-                buffer.PayloadStream.Dispose();
+            _inboundInFlightObjects.Remove(objectId);
+            destination = existing.Destination;
+            dataType = existing.DataType;
+            runspacePoolId = existing.RunspacePoolId;
+            powerShellId = existing.PowerShellId;
+            protoPayloadBytes = existing.PayloadStream.ToArray();
+            existing.PayloadStream.Dispose();
+            return true;
+        }
+
+        private string? DecodeDataFrameToPacketLine(PSHostGrpcFrame frame)
+        {
+            if (!TryReassembleInboundDataFrame(
+                frame,
+                out ulong objectId,
+                out uint destination,
+                out uint dataType,
+                out byte[] runspacePoolId,
+                out byte[] powerShellId,
+                out byte[] protoPayloadBytes))
+            {
+                return null;
             }
 
             byte[] clixmlPayloadBytes;

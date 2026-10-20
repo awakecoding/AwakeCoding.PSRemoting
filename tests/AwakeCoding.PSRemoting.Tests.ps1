@@ -1446,6 +1446,27 @@ Describe 'End-to-End Client Transport Tests' {
 
             $decodedLine = $decodeMethod.Invoke($codec, @($frame))
             $decodedLine | Should -Match "^<Data Stream='Default' PSGuid='$psId'>"
+
+            # Verify direct client raw-fragment encode and direct RemoteDataObject<PSObject> decode (skipping <Data> XML, Base64, and CLIXML on receive)
+            $encodeRawMethod = $codecType.GetMethod('EncodeRawFragmentToFrames', [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+            $tryDecodeRdoMethod = $codecType.GetMethod('TryDecodeDataFrameToRemoteDataObject', [System.Reflection.BindingFlags]'Instance,Public,NonPublic')
+
+            $rawFrames = @($encodeRawMethod.Invoke($codec, @([byte[]]$fragmentBytes.ToArray(), $psId.ToString(), 'Default')))
+            $rawFrames | Should -HaveCount 1
+
+            $decodeArgs = [object[]]@($rawFrames[0], [guid]::Empty, $null)
+            $hasRdo = $tryDecodeRdoMethod.Invoke($codec, $decodeArgs)
+            $hasRdo | Should -BeTrue
+            $decodeArgs[1] | Should -Be $psId
+            $rdo = $decodeArgs[2]
+            $rdo | Should -Not -BeNullOrEmpty
+            $rdoFlags = [System.Reflection.BindingFlags]'Instance,Public,NonPublic'
+            $rdoType = $rdo.GetType()
+            $rdoType.GetProperty('RunspacePoolId', $rdoFlags).GetValue($rdo) | Should -Be $rpId
+            $rdoType.GetProperty('PowerShellId', $rdoFlags).GetValue($rdo) | Should -Be $psId
+            $rdoData = $rdoType.GetProperty('Data', $rdoFlags).GetValue($rdo)
+            $rdoData.Message | Should -Be 'ProtoTest'
+            $rdoData.Value | Should -Be 123
         }
     }
 
