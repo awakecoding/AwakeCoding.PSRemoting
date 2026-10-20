@@ -1437,12 +1437,22 @@ Describe 'End-to-End Client Transport Tests' {
             $frames = @($encodeMethod.Invoke($codec, @($packetLine)))
             $frames | Should -HaveCount 1
             $frame = $frames[0]
-            $frame.Kind.ToString() | Should -Be 'Data'
-            $frame.Payload.Length | Should -BeGreaterThan 0
+            $frame.PacketType.ToString() | Should -Be 'Data'
+            $frame.Destination.ToString() | Should -Be 'Server'
+            $frame.MessageType.ToString() | Should -Be 'PipelineInput'
+            $frame.Data.Length | Should -BeGreaterThan 0
 
-            $payloadText = [System.Text.Encoding]::UTF8.GetString($frame.Payload.ToByteArray())
+            $payloadText = [System.Text.Encoding]::UTF8.GetString($frame.Data.ToByteArray())
             $payloadText | Should -Not -Match '<Obj'
             $payloadText | Should -Match 'ProtoTest'
+
+            $psrpObjectType = [AwakeCoding.PSRemoting.PowerShell.NewPSHostSessionCommand].Assembly.GetType('AwakeCoding.PSRemoting.PowerShell.Grpc.PsrpObject')
+            $parser = $psrpObjectType.GetProperty('Parser', [System.Reflection.BindingFlags]'Static,Public,NonPublic').GetValue($null)
+            $dataStream = [System.IO.MemoryStream]::new($frame.Data.ToByteArray())
+            $parsedPsrpObj = $parser.ParseDelimitedFrom($dataStream)
+            $parsedPsrpObj.ComplexObject.RefId | Should -Be '0'
+            ($parsedPsrpObj.ComplexObject.ExtendedProperties | Where-Object PropertyName -eq 'Message').StringValue | Should -Be 'ProtoTest'
+            ($parsedPsrpObj.ComplexObject.ExtendedProperties | Where-Object PropertyName -eq 'Value').SignedInt | Should -Be 123
 
             $decodedLine = $decodeMethod.Invoke($codec, @($frame))
             $decodedLine | Should -Match "^<Data Stream='Default' PSGuid='$psId'>"
@@ -1473,10 +1483,10 @@ Describe 'End-to-End Client Transport Tests' {
             $cborFrames = @($encodeRawMethod.Invoke($cborCodec, @([byte[]]$fragmentBytes.ToArray(), $psId.ToString(), 'Default')))
             $cborFrames | Should -HaveCount 1
             $cborFrame = $cborFrames[0]
-            $cborFrame.PayloadEncoding.ToString() | Should -Be 'Cbor'
-            $cborFrame.Payload.Length | Should -BeGreaterThan 0
+            $cborFrame.SerializationFormat.ToString() | Should -Be 'Cbor'
+            $cborFrame.Data.Length | Should -BeGreaterThan 0
 
-            $cborText = [System.Text.Encoding]::UTF8.GetString($cborFrame.Payload.ToByteArray())
+            $cborText = [System.Text.Encoding]::UTF8.GetString($cborFrame.Data.ToByteArray())
             $cborText | Should -Not -Match '<Obj'
             $cborText | Should -Match 'ProtoTest'
 
@@ -1493,10 +1503,10 @@ Describe 'End-to-End Client Transport Tests' {
             $clixmlFrames = @($encodeRawMethod.Invoke($clixmlCodec, @([byte[]]$fragmentBytes.ToArray(), $psId.ToString(), 'Default')))
             $clixmlFrames | Should -HaveCount 1
             $clixmlFrame = $clixmlFrames[0]
-            $clixmlFrame.PayloadEncoding.ToString() | Should -Be 'Clixml'
-            $clixmlFrame.Payload.Length | Should -BeGreaterThan 0
+            $clixmlFrame.SerializationFormat.ToString() | Should -Be 'Clixml'
+            $clixmlFrame.Data.Length | Should -BeGreaterThan 0
 
-            $clixmlText = [System.Text.Encoding]::UTF8.GetString($clixmlFrame.Payload.ToByteArray())
+            $clixmlText = [System.Text.Encoding]::UTF8.GetString($clixmlFrame.Data.ToByteArray())
             $clixmlText | Should -Match '<Obj'
             $clixmlText | Should -Match 'ProtoTest'
 

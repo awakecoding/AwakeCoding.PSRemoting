@@ -28,7 +28,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Protobuf Include="Protos\pshostgrpc.proto" GrpcServices="Both" />
+    <Protobuf Include="Protos\psrp.proto" GrpcServices="Both" Access="Internal" />
   </ItemGroup>
 
 </Project>

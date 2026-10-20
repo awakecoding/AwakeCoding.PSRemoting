@@ -159,16 +159,16 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             public uint Destination;
             public uint DataType;
-            public PSHostGrpcPayloadEncoding PayloadEncoding;
+            public PsrpSerializationFormat PayloadEncoding;
             public byte[] RunspacePoolId = Array.Empty<byte>();
             public byte[] PowerShellId = Array.Empty<byte>();
             public readonly MemoryStream PayloadStream = new MemoryStream();
         }
 
         /// <summary>
-        /// Encodes a single OutOfProcess PSRP XML packet line into one or more Protobuf-backed <see cref="PSHostGrpcFrame"/> messages.
+        /// Encodes a single OutOfProcess PSRP XML packet line into one or more Protobuf-backed <see cref="PsrpPacket"/> messages.
         /// </summary>
-        public IEnumerable<PSHostGrpcFrame> EncodePacketLineToFrames(string line)
+        public IEnumerable<PsrpPacket> EncodePacketLineToFrames(string line)
         {
             string trimmed = line.Trim();
             if (trimmed.Length == 0)
@@ -200,31 +200,31 @@ namespace AwakeCoding.PSRemoting.PowerShell
             switch (elementName)
             {
                 case "DataAck":
-                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.DataAck, PsGuid = psGuid };
+                    yield return new PsrpPacket { PacketType = PsrpPacketType.DataAck, PsGuid = psGuid };
                     yield break;
 
                 case "Command":
-                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.Command, PsGuid = psGuid };
+                    yield return new PsrpPacket { PacketType = PsrpPacketType.Command, PsGuid = psGuid };
                     yield break;
 
                 case "CommandAck":
-                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.CommandAck, PsGuid = psGuid };
+                    yield return new PsrpPacket { PacketType = PsrpPacketType.CommandAck, PsGuid = psGuid };
                     yield break;
 
                 case "Close":
-                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.ClosePacket, PsGuid = psGuid };
+                    yield return new PsrpPacket { PacketType = PsrpPacketType.ClosePacket, PsGuid = psGuid };
                     yield break;
 
                 case "CloseAck":
-                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.CloseAck, PsGuid = psGuid };
+                    yield return new PsrpPacket { PacketType = PsrpPacketType.CloseAck, PsGuid = psGuid };
                     yield break;
 
                 case "Signal":
-                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.Signal, PsGuid = psGuid };
+                    yield return new PsrpPacket { PacketType = PsrpPacketType.Signal, PsGuid = psGuid };
                     yield break;
 
                 case "SignalAck":
-                    yield return new PSHostGrpcFrame { Kind = PSHostGrpcFrameKind.SignalAck, PsGuid = psGuid };
+                    yield return new PsrpPacket { PacketType = PsrpPacketType.SignalAck, PsGuid = psGuid };
                     yield break;
 
                 case "Data":
@@ -242,10 +242,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
         }
 
         /// <summary>
-        /// Encodes raw PSRP fragment bytes directly into one or more Protobuf-backed <see cref="PSHostGrpcFrame"/> messages,
+        /// Encodes raw PSRP fragment bytes directly into one or more Protobuf-backed <see cref="PsrpPacket"/> messages,
         /// bypassing <c>OutOfProcessUtils.CreateDataPacket</c> XML and Base64 encoding.
         /// </summary>
-        public IEnumerable<PSHostGrpcFrame> EncodeRawFragmentToFrames(byte[] rawBytes, string psGuid, string streamAttr = "Default")
+        public IEnumerable<PsrpPacket> EncodeRawFragmentToFrames(byte[] rawBytes, string psGuid, string streamAttr = "Default")
         {
             int offset = 0;
             while (offset + FragmentHeaderLength <= rawBytes.Length)
@@ -310,7 +310,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 byte[] runspacePoolId = fullObjectBytes.AsSpan(8, 16).ToArray();
                 byte[] powerShellId = fullObjectBytes.AsSpan(24, 16).ToArray();
 
-                PSHostGrpcPayloadEncoding wireEncoding = ToWireEncoding(Encoding);
+                PsrpSerializationFormat wireEncoding = ToWireEncoding(Encoding);
 
                 byte[] binaryPayloadBytes;
                 int clixmlLength = fullObjectBytes.Length - RemoteDataObjectHeaderLength;
@@ -326,20 +326,20 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                 if (binaryPayloadBytes.Length <= DefaultMaxFragmentBlobSize)
                 {
-                    yield return new PSHostGrpcFrame
+                    yield return new PsrpPacket
                     {
-                        Kind = PSHostGrpcFrameKind.Data,
+                        PacketType = PsrpPacketType.Data,
                         PsGuid = psGuid,
                         Stream = streamAttr,
                         ObjectId = objectId,
                         FragmentId = 0,
-                        BlobFlags = FragmentFlagStartAndEnd,
-                        Destination = destination,
-                        DataType = dataType,
-                        RunspacePoolId = ByteString.CopyFrom(runspacePoolId),
-                        PowershellId = ByteString.CopyFrom(powerShellId),
-                        Payload = ByteString.CopyFrom(binaryPayloadBytes),
-                        PayloadEncoding = wireEncoding
+                        FragmentFlags = FragmentFlagStartAndEnd,
+                        Destination = (PsrpDestination)destination,
+                        MessageType = (PsrpMessageType)dataType,
+                        Rpid = ByteString.CopyFrom(runspacePoolId),
+                        Pid = ByteString.CopyFrom(powerShellId),
+                        Data = ByteString.CopyFrom(binaryPayloadBytes),
+                        SerializationFormat = wireEncoding
                     };
                 }
                 else
@@ -359,20 +359,20 @@ namespace AwakeCoding.PSRemoting.PowerShell
                             outFlags |= FragmentFlagEnd;
                         }
 
-                        yield return new PSHostGrpcFrame
+                        yield return new PsrpPacket
                         {
-                            Kind = PSHostGrpcFrameKind.Data,
+                            PacketType = PsrpPacketType.Data,
                             PsGuid = psGuid,
                             Stream = streamAttr,
                             ObjectId = objectId,
                             FragmentId = outFragId++,
-                            BlobFlags = outFlags,
-                            Destination = destination,
-                            DataType = dataType,
-                            RunspacePoolId = ByteString.CopyFrom(runspacePoolId),
-                            PowershellId = ByteString.CopyFrom(powerShellId),
-                            Payload = ByteString.CopyFrom(binaryPayloadBytes, protoOffset, chunkLen),
-                            PayloadEncoding = wireEncoding
+                            FragmentFlags = outFlags,
+                            Destination = (PsrpDestination)destination,
+                            MessageType = (PsrpMessageType)dataType,
+                            Rpid = ByteString.CopyFrom(runspacePoolId),
+                            Pid = ByteString.CopyFrom(powerShellId),
+                            Data = ByteString.CopyFrom(binaryPayloadBytes, protoOffset, chunkLen),
+                            SerializationFormat = wireEncoding
                         };
 
                         protoOffset += chunkLen;
@@ -382,10 +382,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
         }
 
         /// <summary>
-        /// Encodes a <c>RemoteDataObject</c> directly into one or more <see cref="PSHostGrpcFrame"/> messages
+        /// Encodes a <c>RemoteDataObject</c> directly into one or more <see cref="PsrpPacket"/> messages
         /// using the configured wire encoding without intermediate CLIXML or PSRP fragmentation.
         /// </summary>
-        public IEnumerable<PSHostGrpcFrame> EncodeRemoteDataObjectToFrames(
+        public IEnumerable<PsrpPacket> EncodeRemoteDataObjectToFrames(
             object remoteDataObject,
             string psGuid,
             string streamAttr = "Default")
@@ -421,9 +421,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
         /// <summary>
         /// Encodes a PSRP payload object and its <c>RemoteDataObject</c> header fields directly into
-        /// one or more <see cref="PSHostGrpcFrame"/> messages without intermediate CLIXML serialization.
+        /// one or more <see cref="PsrpPacket"/> messages without intermediate CLIXML serialization.
         /// </summary>
-        public IEnumerable<PSHostGrpcFrame> EncodeDirectPayloadToFrames(
+        public IEnumerable<PsrpPacket> EncodeDirectPayloadToFrames(
             uint destination,
             uint dataType,
             Guid runspacePoolId,
@@ -433,7 +433,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             string streamAttr = "Default")
         {
             ulong objectId = ((ulong)System.Threading.Interlocked.Increment(ref _nextDirectObjectId)) | 0x80000000_00000000UL;
-            PSHostGrpcPayloadEncoding wireEncoding = ToWireEncoding(Encoding);
+            PsrpSerializationFormat wireEncoding = ToWireEncoding(Encoding);
             byte[] binaryPayloadBytes = payloadObject != null
                 ? SerializeRemotingPayload(payloadObject, wireEncoding)
                 : Array.Empty<byte>();
@@ -442,20 +442,20 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
             if (binaryPayloadBytes.Length <= DefaultMaxFragmentBlobSize)
             {
-                yield return new PSHostGrpcFrame
+                yield return new PsrpPacket
                 {
-                    Kind = PSHostGrpcFrameKind.Data,
+                    PacketType = PsrpPacketType.Data,
                     PsGuid = psGuid,
                     Stream = streamAttr,
                     ObjectId = objectId,
                     FragmentId = 0,
-                    BlobFlags = FragmentFlagStartAndEnd,
-                    Destination = destination,
-                    DataType = dataType,
-                    RunspacePoolId = rsPoolBytes,
-                    PowershellId = psBytes,
-                    Payload = ByteString.CopyFrom(binaryPayloadBytes),
-                    PayloadEncoding = wireEncoding
+                    FragmentFlags = FragmentFlagStartAndEnd,
+                    Destination = (PsrpDestination)destination,
+                    MessageType = (PsrpMessageType)dataType,
+                    Rpid = rsPoolBytes,
+                    Pid = psBytes,
+                    Data = ByteString.CopyFrom(binaryPayloadBytes),
+                    SerializationFormat = wireEncoding
                 };
             }
             else
@@ -475,20 +475,20 @@ namespace AwakeCoding.PSRemoting.PowerShell
                         outFlags |= FragmentFlagEnd;
                     }
 
-                    yield return new PSHostGrpcFrame
+                    yield return new PsrpPacket
                     {
-                        Kind = PSHostGrpcFrameKind.Data,
+                        PacketType = PsrpPacketType.Data,
                         PsGuid = psGuid,
                         Stream = streamAttr,
                         ObjectId = objectId,
                         FragmentId = outFragId++,
-                        BlobFlags = outFlags,
-                        Destination = destination,
-                        DataType = dataType,
-                        RunspacePoolId = rsPoolBytes,
-                        PowershellId = psBytes,
-                        Payload = ByteString.CopyFrom(binaryPayloadBytes, protoOffset, chunkLen),
-                        PayloadEncoding = wireEncoding
+                        FragmentFlags = outFlags,
+                        Destination = (PsrpDestination)destination,
+                        MessageType = (PsrpMessageType)dataType,
+                        Rpid = rsPoolBytes,
+                        Pid = psBytes,
+                        Data = ByteString.CopyFrom(binaryPayloadBytes, protoOffset, chunkLen),
+                        SerializationFormat = wireEncoding
                     };
 
                     protoOffset += chunkLen;
@@ -497,35 +497,35 @@ namespace AwakeCoding.PSRemoting.PowerShell
         }
 
         /// <summary>
-        /// Decodes a <see cref="PSHostGrpcFrame"/> into an OutOfProcess PSRP XML packet line,
+        /// Decodes a <see cref="PsrpPacket"/> into an OutOfProcess PSRP XML packet line,
         /// or returns <c>null</c> if the frame is a non-final fragment of a multi-fragment PSRP object.
         /// </summary>
-        public string? DecodeFrameToPacketLine(PSHostGrpcFrame frame)
+        public string? DecodeFrameToPacketLine(PsrpPacket frame)
         {
-            switch (frame.Kind)
+            switch (frame.PacketType)
             {
-                case PSHostGrpcFrameKind.DataAck:
+                case PsrpPacketType.DataAck:
                     return $"<DataAck PSGuid='{frame.PsGuid}' />";
 
-                case PSHostGrpcFrameKind.Command:
+                case PsrpPacketType.Command:
                     return $"<Command PSGuid='{frame.PsGuid}' />";
 
-                case PSHostGrpcFrameKind.CommandAck:
+                case PsrpPacketType.CommandAck:
                     return $"<CommandAck PSGuid='{frame.PsGuid}' />";
 
-                case PSHostGrpcFrameKind.ClosePacket:
+                case PsrpPacketType.ClosePacket:
                     return $"<Close PSGuid='{frame.PsGuid}' />";
 
-                case PSHostGrpcFrameKind.CloseAck:
+                case PsrpPacketType.CloseAck:
                     return $"<CloseAck PSGuid='{frame.PsGuid}' />";
 
-                case PSHostGrpcFrameKind.Signal:
+                case PsrpPacketType.Signal:
                     return $"<Signal PSGuid='{frame.PsGuid}' />";
 
-                case PSHostGrpcFrameKind.SignalAck:
+                case PsrpPacketType.SignalAck:
                     return $"<SignalAck PSGuid='{frame.PsGuid}' />";
 
-                case PSHostGrpcFrameKind.Data:
+                case PsrpPacketType.Data:
                     return DecodeDataFrameToPacketLine(frame);
 
                 default:
@@ -534,13 +534,13 @@ namespace AwakeCoding.PSRemoting.PowerShell
         }
 
         /// <summary>
-        /// Decodes an inbound <see cref="PSHostGrpcFrameKind.Data"/> frame directly into a
+        /// Decodes an inbound <see cref="PsrpPacketType.Data"/> frame directly into a
         /// <c>RemoteDataObject&lt;PSObject&gt;</c> using <see cref="ProtoDeserializer"/> or <see cref="CborDeserializer"/>
         /// without re-serializing to CLIXML, Base64, or <c>&lt;Data&gt;</c> XML.
         /// Returns <c>true</c> when a complete PSRP object has been reassembled and decoded.
         /// </summary>
         public bool TryDecodeDataFrameToRemoteDataObject(
-            PSHostGrpcFrame frame,
+            PsrpPacket frame,
             out Guid psGuid,
             out object? remoteDataObject)
         {
@@ -552,7 +552,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 out _,
                 out uint destination,
                 out uint dataType,
-                out PSHostGrpcPayloadEncoding payloadEncoding,
+                out PsrpSerializationFormat payloadEncoding,
                 out byte[] runspacePoolId,
                 out byte[] powerShellId,
                 out byte[] binaryPayloadBytes))
@@ -603,28 +603,28 @@ namespace AwakeCoding.PSRemoting.PowerShell
         }
 
         private bool TryReassembleInboundDataFrame(
-            PSHostGrpcFrame frame,
+            PsrpPacket frame,
             out ulong objectId,
             out uint destination,
             out uint dataType,
-            out PSHostGrpcPayloadEncoding payloadEncoding,
+            out PsrpSerializationFormat payloadEncoding,
             out byte[] runspacePoolId,
             out byte[] powerShellId,
             out byte[] protoPayloadBytes)
         {
             objectId = frame.ObjectId;
-            byte flags = (byte)frame.BlobFlags;
+            byte flags = (byte)frame.FragmentFlags;
             bool isStart = (flags & FragmentFlagStart) != 0;
             bool isEnd = (flags & FragmentFlagEnd) != 0;
 
             if (isStart && isEnd)
             {
-                destination = frame.Destination;
-                dataType = frame.DataType;
-                payloadEncoding = frame.PayloadEncoding;
-                runspacePoolId = frame.RunspacePoolId.ToByteArray();
-                powerShellId = frame.PowershellId.ToByteArray();
-                protoPayloadBytes = frame.Payload.ToByteArray();
+                destination = (uint)frame.Destination;
+                dataType = (uint)frame.MessageType;
+                payloadEncoding = frame.SerializationFormat;
+                runspacePoolId = frame.Rpid.ToByteArray();
+                powerShellId = frame.Pid.ToByteArray();
+                protoPayloadBytes = frame.Data.ToByteArray();
                 return true;
             }
 
@@ -632,18 +632,18 @@ namespace AwakeCoding.PSRemoting.PowerShell
             {
                 var buffer = new ReassemblyBuffer
                 {
-                    Destination = frame.Destination,
-                    DataType = frame.DataType,
-                    PayloadEncoding = frame.PayloadEncoding,
-                    RunspacePoolId = frame.RunspacePoolId.ToByteArray(),
-                    PowerShellId = frame.PowershellId.ToByteArray()
+                    Destination = (uint)frame.Destination,
+                    DataType = (uint)frame.MessageType,
+                    PayloadEncoding = frame.SerializationFormat,
+                    RunspacePoolId = frame.Rpid.ToByteArray(),
+                    PowerShellId = frame.Pid.ToByteArray()
                 };
-                frame.Payload.WriteTo(buffer.PayloadStream);
+                frame.Data.WriteTo(buffer.PayloadStream);
                 _inboundInFlightObjects[objectId] = buffer;
 
                 destination = 0;
                 dataType = 0;
-                payloadEncoding = PSHostGrpcPayloadEncoding.Protobuf;
+                payloadEncoding = PsrpSerializationFormat.Protobuf;
                 runspacePoolId = Array.Empty<byte>();
                 powerShellId = Array.Empty<byte>();
                 protoPayloadBytes = Array.Empty<byte>();
@@ -655,12 +655,12 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 throw new PSRemotingTransportException($"Missing start fragment for inbound gRPC PSRP ObjectId {objectId}.");
             }
 
-            frame.Payload.WriteTo(existing.PayloadStream);
+            frame.Data.WriteTo(existing.PayloadStream);
             if (!isEnd)
             {
                 destination = 0;
                 dataType = 0;
-                payloadEncoding = PSHostGrpcPayloadEncoding.Protobuf;
+                payloadEncoding = PsrpSerializationFormat.Protobuf;
                 runspacePoolId = Array.Empty<byte>();
                 powerShellId = Array.Empty<byte>();
                 protoPayloadBytes = Array.Empty<byte>();
@@ -678,14 +678,14 @@ namespace AwakeCoding.PSRemoting.PowerShell
             return true;
         }
 
-        private string? DecodeDataFrameToPacketLine(PSHostGrpcFrame frame)
+        private string? DecodeDataFrameToPacketLine(PsrpPacket frame)
         {
             if (!TryReassembleInboundDataFrame(
                 frame,
                 out ulong objectId,
                 out uint destination,
                 out uint dataType,
-                out PSHostGrpcPayloadEncoding payloadEncoding,
+                out PsrpSerializationFormat payloadEncoding,
                 out byte[] runspacePoolId,
                 out byte[] powerShellId,
                 out byte[] binaryPayloadBytes))
@@ -758,42 +758,42 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 base64Payload);
         }
 
-        internal static PSHostGrpcPayloadEncoding ToWireEncoding(PSHostGrpcEncoding encoding)
+        internal static PsrpSerializationFormat ToWireEncoding(PSHostGrpcEncoding encoding)
         {
             return encoding switch
             {
-                PSHostGrpcEncoding.Cbor => PSHostGrpcPayloadEncoding.Cbor,
-                PSHostGrpcEncoding.Clixml => PSHostGrpcPayloadEncoding.Clixml,
-                _ => PSHostGrpcPayloadEncoding.Protobuf
+                PSHostGrpcEncoding.Cbor => PsrpSerializationFormat.Cbor,
+                PSHostGrpcEncoding.Clixml => PsrpSerializationFormat.Clixml,
+                _ => PsrpSerializationFormat.Protobuf
             };
         }
 
-        internal static PSHostGrpcEncoding FromWireEncoding(PSHostGrpcPayloadEncoding wireEncoding)
+        internal static PSHostGrpcEncoding FromWireEncoding(PsrpSerializationFormat wireEncoding)
         {
             return wireEncoding switch
             {
-                PSHostGrpcPayloadEncoding.Cbor => PSHostGrpcEncoding.Cbor,
-                PSHostGrpcPayloadEncoding.Clixml => PSHostGrpcEncoding.Clixml,
+                PsrpSerializationFormat.Cbor => PSHostGrpcEncoding.Cbor,
+                PsrpSerializationFormat.Clixml => PSHostGrpcEncoding.Clixml,
                 _ => PSHostGrpcEncoding.Protobuf
             };
         }
 
-        internal static byte[] SerializeRemotingPayload(object? obj, PSHostGrpcPayloadEncoding wireEncoding)
+        internal static byte[] SerializeRemotingPayload(object? obj, PsrpSerializationFormat wireEncoding)
         {
             return wireEncoding switch
             {
-                PSHostGrpcPayloadEncoding.Cbor => SerializeCborRemotingPayload(obj),
-                PSHostGrpcPayloadEncoding.Clixml => SerializeClixmlRemotingPayload(obj),
+                PsrpSerializationFormat.Cbor => SerializeCborRemotingPayload(obj),
+                PsrpSerializationFormat.Clixml => SerializeClixmlRemotingPayload(obj),
                 _ => SerializeProtoRemotingPayload(obj)
             };
         }
 
-        internal static object? DeserializeRemotingPayload(byte[] payloadBytes, PSHostGrpcPayloadEncoding wireEncoding)
+        internal static object? DeserializeRemotingPayload(byte[] payloadBytes, PsrpSerializationFormat wireEncoding)
         {
             return wireEncoding switch
             {
-                PSHostGrpcPayloadEncoding.Cbor => DeserializeCborRemotingPayload(payloadBytes),
-                PSHostGrpcPayloadEncoding.Clixml => DeserializeClixmlRemotingPayload(payloadBytes, 0, payloadBytes.Length),
+                PsrpSerializationFormat.Cbor => DeserializeCborRemotingPayload(payloadBytes),
+                PsrpSerializationFormat.Clixml => DeserializeClixmlRemotingPayload(payloadBytes, 0, payloadBytes.Length),
                 _ => DeserializeProtoRemotingPayload(payloadBytes)
             };
         }

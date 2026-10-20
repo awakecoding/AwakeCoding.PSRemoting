@@ -150,7 +150,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
         private readonly ConcurrentDictionary<Guid, Delegate> _commandSendCallbacks = new ConcurrentDictionary<Guid, Delegate>();
 
         private Channel? _channel;
-        private AsyncDuplexStreamingCall<PSHostGrpcFrame, PSHostGrpcFrame>? _call;
+        private AsyncDuplexStreamingCall<PsrpPacket, PsrpPacket>? _call;
         private CancellationTokenSource? _readerCts;
         private volatile bool _isClosed;
 
@@ -196,7 +196,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 throw new IOException($"Failed to connect to gRPC endpoint '{_connectionInfo.GrpcUri}'", ex);
             }
 
-            var client = new PSHostGrpcTransport.PSHostGrpcTransportClient(_channel);
+            var client = new PsrpTransport.PsrpTransportClient(_channel);
             Metadata? headers = null;
             if (_connectionInfo.HasExplicitEncoding)
             {
@@ -351,7 +351,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             WriteFrames(_outboundCodec.EncodeRawFragmentToFrames(rawFragment, psGuidString, streamAttr));
         }
 
-        private void WriteFrame(PSHostGrpcFrame frame)
+        private void WriteFrame(PsrpPacket frame)
         {
             if (_isClosed)
             {
@@ -378,7 +378,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
         }
 
-        private void WriteFrames(IEnumerable<PSHostGrpcFrame> frames)
+        private void WriteFrames(IEnumerable<PsrpPacket> frames)
         {
             if (_isClosed)
             {
@@ -487,21 +487,21 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     }
 
                     var frame = _call.ResponseStream.Current;
-                    switch (frame.Kind)
+                    switch (frame.PacketType)
                     {
-                        case PSHostGrpcFrameKind.Data:
+                        case PsrpPacketType.Data:
                             HandleInboundDataFrame(frame);
                             break;
 
-                        case PSHostGrpcFrameKind.DataAck:
+                        case PsrpPacketType.DataAck:
                             HandleInboundDataAckFrame(frame);
                             break;
 
-                        case PSHostGrpcFrameKind.CommandAck:
+                        case PsrpPacketType.CommandAck:
                             HandleInboundCommandAckFrame(frame);
                             break;
 
-                        case PSHostGrpcFrameKind.CloseAck:
+                        case PsrpPacketType.CloseAck:
                             {
                                 Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
                                 if (psGuid != Guid.Empty)
@@ -512,39 +512,39 @@ namespace AwakeCoding.PSRemoting.PowerShell
                             }
                             break;
 
-                        case PSHostGrpcFrameKind.SignalAck:
+                        case PsrpPacketType.SignalAck:
                             {
                                 Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
                                 s_onSignalAckPacketReceivedMethod?.Invoke(this, new object[] { psGuid });
                             }
                             break;
 
-                        case PSHostGrpcFrameKind.Command:
+                        case PsrpPacketType.Command:
                             {
                                 Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
                                 s_onCommandCreationPacketReceivedMethod?.Invoke(this, new object[] { psGuid });
                             }
                             break;
 
-                        case PSHostGrpcFrameKind.ClosePacket:
+                        case PsrpPacketType.ClosePacket:
                             {
                                 Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
                                 s_onClosePacketReceivedMethod?.Invoke(this, new object[] { psGuid });
                             }
                             break;
 
-                        case PSHostGrpcFrameKind.Signal:
+                        case PsrpPacketType.Signal:
                             {
                                 Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
                                 s_onSignalPacketReceivedMethod?.Invoke(this, new object[] { psGuid });
                             }
                             break;
 
-                        case PSHostGrpcFrameKind.Error:
-                            ProcessPayload(frame.Payload, errorBuffer, HandleErrorDataReceived);
+                        case PsrpPacketType.Error:
+                            ProcessPayload(frame.Data, errorBuffer, HandleErrorDataReceived);
                             break;
 
-                        case PSHostGrpcFrameKind.Close:
+                        case PsrpPacketType.Close:
                             return;
                     }
                 }
@@ -555,11 +555,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
         }
 
-        private void HandleInboundDataFrame(PSHostGrpcFrame frame)
+        private void HandleInboundDataFrame(PsrpPacket frame)
         {
             if (!_connectionInfo.HasExplicitEncoding)
             {
-                _outboundCodec.Encoding = PSHostGrpcPsrpCodec.FromWireEncoding(frame.PayloadEncoding);
+                _outboundCodec.Encoding = PSHostGrpcPsrpCodec.FromWireEncoding(frame.SerializationFormat);
             }
 
             bool hasObject = _inboundCodec.TryDecodeDataFrameToRemoteDataObject(
@@ -587,7 +587,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
         }
 
-        private void HandleInboundDataAckFrame(PSHostGrpcFrame frame)
+        private void HandleInboundDataAckFrame(PsrpPacket frame)
         {
             Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
             if (psGuid == Guid.Empty)
@@ -600,7 +600,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
         }
 
-        private void HandleInboundCommandAckFrame(PSHostGrpcFrame frame)
+        private void HandleInboundCommandAckFrame(PsrpPacket frame)
         {
             Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
             SendOneCommandItem(psGuid);

@@ -97,7 +97,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                 _grpcServer = new Server
                 {
-                    Services = { PSHostGrpcTransport.BindService(service) },
+                    Services = { PsrpTransport.BindService(service) },
                     Ports = { serverPort }
                 };
 
@@ -245,7 +245,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
         }
 
-        private sealed class PSHostGrpcTransportService : PSHostGrpcTransport.PSHostGrpcTransportBase
+        private sealed class PSHostGrpcTransportService : PsrpTransport.PsrpTransportBase
         {
             private static readonly BindingFlags s_anyFlags = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
 
@@ -392,8 +392,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             public override async Task Connect(
-                IAsyncStreamReader<PSHostGrpcFrame> requestStream,
-                IServerStreamWriter<PSHostGrpcFrame> responseStream,
+                IAsyncStreamReader<PsrpPacket> requestStream,
+                IServerStreamWriter<PsrpPacket> responseStream,
                 ServerCallContext context)
             {
                 if (_owner.IsMaxConnectionsReached())
@@ -433,18 +433,18 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     while (await requestStream.MoveNext(linkedCts.Token).ConfigureAwait(false))
                     {
                         var frame = requestStream.Current;
-                        if (frame.Kind == PSHostGrpcFrameKind.Close)
+                        if (frame.PacketType == PsrpPacketType.Close)
                         {
                             break;
                         }
 
-                        switch (frame.Kind)
+                        switch (frame.PacketType)
                         {
-                            case PSHostGrpcFrameKind.Data:
+                            case PsrpPacketType.Data:
                                 {
                                     if (!clientRequestedEncoding)
                                     {
-                                        outboundCodec.Encoding = PSHostGrpcPsrpCodec.FromWireEncoding(frame.PayloadEncoding);
+                                        outboundCodec.Encoding = PSHostGrpcPsrpCodec.FromWireEncoding(frame.SerializationFormat);
                                     }
 
                                     bool hasObject = inboundCodec.TryDecodeDataFrameToRemoteDataObject(
@@ -477,23 +477,23 @@ namespace AwakeCoding.PSRemoting.PowerShell
                                     await WriteFrameAsync(
                                         responseStream,
                                         writeLock,
-                                        new PSHostGrpcFrame
+                                        new PsrpPacket
                                         {
-                                            Kind = PSHostGrpcFrameKind.DataAck,
+                                            PacketType = PsrpPacketType.DataAck,
                                             PsGuid = psGuidString
                                         },
                                         linkedCts.Token).ConfigureAwait(false);
                                 }
                                 break;
 
-                            case PSHostGrpcFrameKind.Command:
+                            case PsrpPacketType.Command:
                                 {
                                     Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
                                     s_createCommandTransportManagerMethod?.Invoke(sessionTM, new object[] { psGuid });
                                 }
                                 break;
 
-                            case PSHostGrpcFrameKind.Signal:
+                            case PsrpPacketType.Signal:
                                 {
                                     Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
                                     string psGuidString = psGuid.ToString();
@@ -509,16 +509,16 @@ namespace AwakeCoding.PSRemoting.PowerShell
                                     await WriteFrameAsync(
                                         responseStream,
                                         writeLock,
-                                        new PSHostGrpcFrame
+                                        new PsrpPacket
                                         {
-                                            Kind = PSHostGrpcFrameKind.SignalAck,
+                                            PacketType = PsrpPacketType.SignalAck,
                                             PsGuid = psGuidString
                                         },
                                         linkedCts.Token).ConfigureAwait(false);
                                 }
                                 break;
 
-                            case PSHostGrpcFrameKind.ClosePacket:
+                            case PsrpPacketType.ClosePacket:
                                 {
                                     Guid psGuid = PSHostGrpcPsrpCodec.ParsePsGuid(frame.PsGuid);
                                     string psGuidString = psGuid.ToString();
@@ -540,9 +540,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
                                     await WriteFrameAsync(
                                         responseStream,
                                         writeLock,
-                                        new PSHostGrpcFrame
+                                        new PsrpPacket
                                         {
-                                            Kind = PSHostGrpcFrameKind.CloseAck,
+                                            PacketType = PsrpPacketType.CloseAck,
                                             PsGuid = psGuidString
                                         },
                                         linkedCts.Token).ConfigureAwait(false);
@@ -600,7 +600,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
             private static bool TryHookRunspacePoolDriver(
                 object serverSession,
                 object sessionTM,
-                IServerStreamWriter<PSHostGrpcFrame> responseStream,
+                IServerStreamWriter<PsrpPacket> responseStream,
                 SemaphoreSlim writeLock,
                 PSHostGrpcPsrpCodec outboundCodec,
                 CancellationToken cancellationToken)
@@ -641,9 +641,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             private static async Task WriteFrameAsync(
-                IServerStreamWriter<PSHostGrpcFrame> responseStream,
+                IServerStreamWriter<PsrpPacket> responseStream,
                 SemaphoreSlim writeLock,
-                PSHostGrpcFrame frame,
+                PsrpPacket frame,
                 CancellationToken cancellationToken)
             {
                 await writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -658,9 +658,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
 
             private static void WriteFramesSync(
-                IServerStreamWriter<PSHostGrpcFrame> responseStream,
+                IServerStreamWriter<PsrpPacket> responseStream,
                 SemaphoreSlim writeLock,
-                IEnumerable<PSHostGrpcFrame> frames,
+                IEnumerable<PsrpPacket> frames,
                 CancellationToken cancellationToken)
             {
                 if (cancellationToken.IsCancellationRequested)
@@ -706,7 +706,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 private readonly object _rpDriver;
                 private readonly object _sessionTM;
                 private readonly Delegate _originalHandler;
-                private readonly IServerStreamWriter<PSHostGrpcFrame> _responseStream;
+                private readonly IServerStreamWriter<PsrpPacket> _responseStream;
                 private readonly SemaphoreSlim _writeLock;
                 private readonly PSHostGrpcPsrpCodec _outboundCodec;
                 private readonly CancellationToken _cancellationToken;
@@ -715,7 +715,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     object rpDriver,
                     object sessionTM,
                     Delegate originalHandler,
-                    IServerStreamWriter<PSHostGrpcFrame> responseStream,
+                    IServerStreamWriter<PsrpPacket> responseStream,
                     SemaphoreSlim writeLock,
                     PSHostGrpcPsrpCodec outboundCodec,
                     CancellationToken cancellationToken)
@@ -1062,7 +1062,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
             private sealed class GrpcServerTextWriter : TextWriter
             {
-                private readonly IServerStreamWriter<PSHostGrpcFrame> _responseStream;
+                private readonly IServerStreamWriter<PsrpPacket> _responseStream;
                 private readonly SemaphoreSlim _writeLock;
                 private readonly PSHostGrpcPsrpCodec _outboundCodec;
                 private readonly bool _isError;
@@ -1071,7 +1071,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 public override Encoding Encoding => Encoding.UTF8;
 
                 public GrpcServerTextWriter(
-                    IServerStreamWriter<PSHostGrpcFrame> responseStream,
+                    IServerStreamWriter<PsrpPacket> responseStream,
                     SemaphoreSlim writeLock,
                     PSHostGrpcPsrpCodec outboundCodec,
                     bool isError,
@@ -1093,10 +1093,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                     if (_isError)
                     {
-                        var frame = new PSHostGrpcFrame
+                        var frame = new PsrpPacket
                         {
-                            Kind = PSHostGrpcFrameKind.Error,
-                            Payload = ByteString.CopyFromUtf8(value + "\n")
+                            PacketType = PsrpPacketType.Error,
+                            Data = ByteString.CopyFromUtf8(value + "\n")
                         };
                         WriteFramesSync(_responseStream, _writeLock, new[] { frame }, _cancellationToken);
                         return;
