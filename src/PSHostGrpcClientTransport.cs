@@ -476,11 +476,7 @@ namespace AwakeCoding.PSRemoting.PowerShell
                     {
                         break;
                     }
-                    catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
-                    {
-                        break;
-                    }
-                    catch (RpcException ex) when (ex.StatusCode == StatusCode.Unavailable && _isClosed)
+                    catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled || ex.StatusCode == StatusCode.Unavailable)
                     {
                         break;
                     }

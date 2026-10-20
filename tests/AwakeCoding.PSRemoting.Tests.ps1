@@ -1582,6 +1582,28 @@ Describe 'End-to-End Client Transport Tests' {
                 Stop-PSHostServer -Server $cborServer -Force -ErrorAction SilentlyContinue
             }
         }
+
+        It 'Streams pipeline input and informational/error records over in-process gRPC server across all encodings' {
+            foreach ($enc in @('Protobuf', 'Cbor', 'Clixml')) {
+                $session = New-PSHostSession -GrpcUri $script:GrpcUri -GrpcEncoding $enc -OpenTimeout 15000
+                try {
+                    $piped = 1..5 | Invoke-Command -Session $session -ScriptBlock { process { $_ * 10 } } -ErrorAction Stop
+                    $piped | Should -Be @(10, 20, 30, 40, 50)
+
+                    $warn = $null
+                    $out = Invoke-Command -Session $session -ScriptBlock {
+                        Write-Warning "warn-$using:enc"
+                        "ok-$using:enc"
+                    } -WarningVariable warn -WarningAction SilentlyContinue -ErrorAction Stop
+                    $out | Should -Be "ok-$enc"
+                    $warn | Should -HaveCount 1
+                    $warn[0].ToString() | Should -Be "warn-$enc"
+                }
+                finally {
+                    Remove-PSHostSessionSafely -Session $session
+                }
+            }
+        }
     }
 
     Context 'Transport Error Handling' {

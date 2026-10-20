@@ -130,6 +130,16 @@ namespace AwakeCoding.PSRemoting.PowerShell
             return null;
         }
 
+        private static readonly Type? s_remoteDataObjectOfObjectType = typeof(PSObject).Assembly.GetType(
+            "System.Management.Automation.Remoting.RemoteDataObject")
+            ?? typeof(PSObject).Assembly.GetType("System.Management.Automation.Remoting.RemoteDataObject`1")?.MakeGenericType(typeof(object));
+        private static readonly PropertyInfo? s_rdoDestinationProp = s_remoteDataObjectOfObjectType?.GetProperty("Destination", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly PropertyInfo? s_rdoDataTypeProp = s_remoteDataObjectOfObjectType?.GetProperty("DataType", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly PropertyInfo? s_rdoRunspacePoolIdProp = s_remoteDataObjectOfObjectType?.GetProperty("RunspacePoolId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly PropertyInfo? s_rdoPowerShellIdProp = s_remoteDataObjectOfObjectType?.GetProperty("PowerShellId", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        private static readonly PropertyInfo? s_rdoDataProp = s_remoteDataObjectOfObjectType?.GetProperty("Data", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private long _nextDirectObjectId;
         private readonly Dictionary<ulong, MemoryStream> _outboundInFlightObjects = new Dictionary<ulong, MemoryStream>();
         private readonly Dictionary<ulong, ReassemblyBuffer> _inboundInFlightObjects = new Dictionary<ulong, ReassemblyBuffer>();
 
@@ -372,6 +382,121 @@ namespace AwakeCoding.PSRemoting.PowerShell
         }
 
         /// <summary>
+        /// Encodes a <c>RemoteDataObject</c> directly into one or more <see cref="PSHostGrpcFrame"/> messages
+        /// using the configured wire encoding without intermediate CLIXML or PSRP fragmentation.
+        /// </summary>
+        public IEnumerable<PSHostGrpcFrame> EncodeRemoteDataObjectToFrames(
+            object remoteDataObject,
+            string psGuid,
+            string streamAttr = "Default")
+        {
+            if (remoteDataObject == null)
+            {
+                throw new ArgumentNullException(nameof(remoteDataObject));
+            }
+
+            uint destination = s_rdoDestinationProp?.GetValue(remoteDataObject) is object destVal
+                ? Convert.ToUInt32(destVal, CultureInfo.InvariantCulture)
+                : 0u;
+            uint dataType = s_rdoDataTypeProp?.GetValue(remoteDataObject) is object dtVal
+                ? Convert.ToUInt32(dtVal, CultureInfo.InvariantCulture)
+                : 0u;
+            Guid runspacePoolId = s_rdoRunspacePoolIdProp?.GetValue(remoteDataObject) is Guid rsGuid
+                ? rsGuid
+                : Guid.Empty;
+            Guid powerShellId = s_rdoPowerShellIdProp?.GetValue(remoteDataObject) is Guid psIdGuid
+                ? psIdGuid
+                : Guid.Empty;
+            object? payloadObject = s_rdoDataProp?.GetValue(remoteDataObject);
+
+            return EncodeDirectPayloadToFrames(
+                destination,
+                dataType,
+                runspacePoolId,
+                powerShellId,
+                payloadObject,
+                psGuid,
+                streamAttr);
+        }
+
+        /// <summary>
+        /// Encodes a PSRP payload object and its <c>RemoteDataObject</c> header fields directly into
+        /// one or more <see cref="PSHostGrpcFrame"/> messages without intermediate CLIXML serialization.
+        /// </summary>
+        public IEnumerable<PSHostGrpcFrame> EncodeDirectPayloadToFrames(
+            uint destination,
+            uint dataType,
+            Guid runspacePoolId,
+            Guid powerShellId,
+            object? payloadObject,
+            string psGuid,
+            string streamAttr = "Default")
+        {
+            ulong objectId = ((ulong)System.Threading.Interlocked.Increment(ref _nextDirectObjectId)) | 0x80000000_00000000UL;
+            PSHostGrpcPayloadEncoding wireEncoding = ToWireEncoding(Encoding);
+            byte[] binaryPayloadBytes = payloadObject != null
+                ? SerializeRemotingPayload(payloadObject, wireEncoding)
+                : Array.Empty<byte>();
+            ByteString rsPoolBytes = ByteString.CopyFrom(runspacePoolId.ToByteArray());
+            ByteString psBytes = ByteString.CopyFrom(powerShellId.ToByteArray());
+
+            if (binaryPayloadBytes.Length <= DefaultMaxFragmentBlobSize)
+            {
+                yield return new PSHostGrpcFrame
+                {
+                    Kind = PSHostGrpcFrameKind.Data,
+                    PsGuid = psGuid,
+                    Stream = streamAttr,
+                    ObjectId = objectId,
+                    FragmentId = 0,
+                    BlobFlags = FragmentFlagStartAndEnd,
+                    Destination = destination,
+                    DataType = dataType,
+                    RunspacePoolId = rsPoolBytes,
+                    PowershellId = psBytes,
+                    Payload = ByteString.CopyFrom(binaryPayloadBytes),
+                    PayloadEncoding = wireEncoding
+                };
+            }
+            else
+            {
+                int protoOffset = 0;
+                ulong outFragId = 0;
+                while (protoOffset < binaryPayloadBytes.Length)
+                {
+                    int chunkLen = Math.Min(DefaultMaxFragmentBlobSize, binaryPayloadBytes.Length - protoOffset);
+                    byte outFlags = 0;
+                    if (protoOffset == 0)
+                    {
+                        outFlags |= FragmentFlagStart;
+                    }
+                    if (protoOffset + chunkLen >= binaryPayloadBytes.Length)
+                    {
+                        outFlags |= FragmentFlagEnd;
+                    }
+
+                    yield return new PSHostGrpcFrame
+                    {
+                        Kind = PSHostGrpcFrameKind.Data,
+                        PsGuid = psGuid,
+                        Stream = streamAttr,
+                        ObjectId = objectId,
+                        FragmentId = outFragId++,
+                        BlobFlags = outFlags,
+                        Destination = destination,
+                        DataType = dataType,
+                        RunspacePoolId = rsPoolBytes,
+                        PowershellId = psBytes,
+                        Payload = ByteString.CopyFrom(binaryPayloadBytes, protoOffset, chunkLen),
+                        PayloadEncoding = wireEncoding
+                    };
+
+                    protoOffset += chunkLen;
+                }
+            }
+        }
+
+        /// <summary>
         /// Decodes a <see cref="PSHostGrpcFrame"/> into an OutOfProcess PSRP XML packet line,
         /// or returns <c>null</c> if the frame is a non-final fragment of a multi-fragment PSRP object.
         /// </summary>
@@ -443,7 +568,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
             PSObject? psObj = null;
             if (binaryPayloadBytes.Length > 0)
             {
-                psObj = DeserializeRemotingPayload(binaryPayloadBytes, payloadEncoding) as PSObject;
+                object? decoded = DeserializeRemotingPayload(binaryPayloadBytes, payloadEncoding);
+                if (decoded != null)
+                {
+                    psObj = decoded as PSObject ?? PSObject.AsPSObject(decoded);
+                }
             }
 
             Guid rsPoolGuid = runspacePoolId.Length == 16 ? new Guid(runspacePoolId) : Guid.Empty;
