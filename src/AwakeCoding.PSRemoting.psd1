@@ -77,7 +77,19 @@ RequiredAssemblies = @(
 FunctionsToExport = @()
 
 # Cmdlets to export from this module, for best performance, do not use wildcards and do not delete the entry, use an empty array if there are no cmdlets to export.
-CmdletsToExport = @('New-PSHostSession', 'Enter-PSHostSession', 'Connect-PSHostProcess', 'Update-PSHostProcessEnvironment', 'Start-PSHostServer', 'Stop-PSHostServer', 'Get-PSHostServer')
+CmdletsToExport = @(
+    'New-PSHostSession',
+    'Enter-PSHostSession',
+    'Connect-PSHostProcess',
+    'Update-PSHostProcessEnvironment',
+    'Start-PSHostServer',
+    'Stop-PSHostServer',
+    'Get-PSHostServer',
+    'Export-PSObject',
+    'Import-PSObject',
+    'ConvertTo-PSObject',
+    'ConvertFrom-PSObject'
+)
 
 # Variables to export from this module
 VariablesToExport = @()

@@ -1056,22 +1056,30 @@ namespace System.Management.Automation
 
         private static Func<PSObject, TypeTable?, bool>? CompileHasTypeTableMembersCheck()
         {
-            MethodInfo? target = null;
+            MethodInfo? target1 = null;
+            MethodInfo? target2 = null;
             foreach (MethodInfo m in typeof(PSObject).GetMethods(AllStatic))
             {
-                if (m.Name == "TypeTableGetMembersDelegate" && m.IsGenericMethodDefinition && m.GetParameters().Length == 2)
+                if (m.Name == "TypeTableGetMembersDelegate" && m.IsGenericMethodDefinition)
                 {
-                    target = m.MakeGenericMethod(typeof(PSMemberInfo));
-                    break;
+                    int paramCount = m.GetParameters().Length;
+                    if (paramCount == 1)
+                    {
+                        target1 = m.MakeGenericMethod(typeof(PSMemberInfo));
+                    }
+                    else if (paramCount == 2)
+                    {
+                        target2 = m.MakeGenericMethod(typeof(PSMemberInfo));
+                    }
                 }
             }
 
-            if (target is null)
+            if (target2 is null)
             {
                 return null;
             }
 
-            PropertyInfo? countProp = target.ReturnType.GetProperty("Count", AllInstance);
+            PropertyInfo? countProp = target2.ReturnType.GetProperty("Count", AllInstance);
             if (countProp is null)
             {
                 return null;
@@ -1079,12 +1087,18 @@ namespace System.Management.Automation
 
             ParameterExpression pso = Expression.Parameter(typeof(PSObject), "pso");
             ParameterExpression typeTable = Expression.Parameter(typeof(TypeTable), "typeTable");
-            ParameterExpression resultVar = Expression.Variable(target.ReturnType, "members");
+            ParameterExpression resultVar = Expression.Variable(target2.ReturnType, "members");
+            Expression callExpr = target1 is not null
+                ? Expression.Condition(
+                    Expression.Equal(typeTable, Expression.Constant(null, typeof(TypeTable))),
+                    Expression.Call(target1, pso),
+                    Expression.Call(target2, pso, typeTable))
+                : Expression.Call(target2, pso, typeTable);
             BlockExpression block = Expression.Block(
                 new[] { resultVar },
-                Expression.Assign(resultVar, Expression.Call(target, pso, typeTable)),
+                Expression.Assign(resultVar, callExpr),
                 Expression.AndAlso(
-                    Expression.NotEqual(resultVar, Expression.Constant(null, target.ReturnType)),
+                    Expression.NotEqual(resultVar, Expression.Constant(null, target2.ReturnType)),
                     Expression.GreaterThan(Expression.Property(resultVar, countProp), Expression.Constant(0))));
             return Expression.Lambda<Func<PSObject, TypeTable?, bool>>(block, pso, typeTable).Compile();
         }

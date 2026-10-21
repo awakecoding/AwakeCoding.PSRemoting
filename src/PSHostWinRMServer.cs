@@ -22,9 +22,10 @@ namespace AwakeCoding.PSRemoting.PowerShell
         public string ShellId { get; }
 
         private Process? _process;
-        private readonly BlockingCollection<string> _stdoutQueue;
-        private readonly List<string> _deferredStdoutLines = new();
-        private readonly object _stdoutLock = new();
+        private readonly BlockingCollection<string> _sessionStdoutQueue;
+        private readonly BlockingCollection<string> _commandStdoutQueue;
+        private readonly ManualResetEventSlim _ackEvent = new(false);
+        private readonly object _stdinLock = new();
         private Thread? _stdoutReaderThread;
         private Thread? _stderrReaderThread;
         private volatile bool _disposed;
@@ -36,7 +37,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
         {
             ShellId = shellId ?? throw new ArgumentNullException(nameof(shellId));
             _process = process ?? throw new ArgumentNullException(nameof(process));
-            _stdoutQueue = new BlockingCollection<string>(1024);
+            _sessionStdoutQueue = new BlockingCollection<string>(1024);
+            _commandStdoutQueue = new BlockingCollection<string>(1024);
         }
 
         /// <summary>
@@ -60,83 +62,71 @@ namespace AwakeCoding.PSRemoting.PowerShell
         }
 
         /// <summary>
-        /// Write PSRP data to the subprocess stdin.
+        /// Write PSRP data to the subprocess stdin and wait for the corresponding
+        /// OutOfProcessMediator ack (<c>DataAck</c>, <c>CommandAck</c>, <c>CloseAck</c>, or <c>SignalAck</c>)
+        /// so that <c>pwsh -s</c> does not schedule dependent packets out of order on the ThreadPool.
         /// </summary>
         public void WriteToStdin(string data)
         {
-            if (_disposed || _process == null || _process.HasExited) return;
-            try
+            if (_disposed) return;
+
+            lock (_stdinLock)
             {
-                _process.StandardInput.WriteLine(data);
-                _process.StandardInput.Flush();
+                if (_disposed || _process == null || _process.HasExited) return;
+                try
+                {
+                    _ackEvent.Reset();
+                    _process.StandardInput.WriteLine(data);
+                    _process.StandardInput.Flush();
+                    _ackEvent.Wait(5000);
+                }
+                catch { }
             }
-            catch { }
         }
 
         /// <summary>
-        /// Try to dequeue a line from stdout within the given timeout.
+        /// Try to dequeue a line from the session or command stdout queue within the given timeout.
         /// Returns null if the timeout expires or the shell has closed.
         /// </summary>
-        public string? TryDequeueStdoutLine(int timeoutMs, Func<string, bool>? predicate = null)
+        public string? TryDequeueStdoutLine(int timeoutMs, bool isCommandStream)
         {
             if (_disposed) return null;
 
-            if (TryTakeDeferredLine(predicate, out string? deferredLine))
-                return deferredLine;
-
-            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-
-            while (!_disposed)
+            var queue = isCommandStream ? _commandStdoutQueue : _sessionStdoutQueue;
+            try
             {
-                int remainingMs = timeoutMs < 0
-                    ? Timeout.Infinite
-                    : Math.Max(0, (int)(deadline - DateTime.UtcNow).TotalMilliseconds);
-                if (timeoutMs >= 0 && remainingMs == 0)
-                    return null;
-
-                try
-                {
-                    if (!_stdoutQueue.TryTake(out string? line, remainingMs))
-                        return null;
-
-                    if (predicate == null || predicate(line))
-                        return line;
-
-                    lock (_stdoutLock)
-                    {
-                        _deferredStdoutLines.Add(line);
-                    }
-
-                    if (TryTakeDeferredLine(predicate, out deferredLine))
-                        return deferredLine;
-                }
-                catch (InvalidOperationException)
-                {
-                    return null;
-                }
+                return queue.TryTake(out string? line, timeoutMs) ? line : null;
             }
-
-            return null;
+            catch (InvalidOperationException)
+            {
+                return null;
+            }
         }
 
-        private bool TryTakeDeferredLine(Func<string, bool>? predicate, out string? line)
+        private static bool IsAckPacket(string trimmed)
         {
-            lock (_stdoutLock)
+            return trimmed.StartsWith("<DataAck ", StringComparison.OrdinalIgnoreCase) ||
+                   trimmed.StartsWith("<CommandAck ", StringComparison.OrdinalIgnoreCase) ||
+                   trimmed.StartsWith("<CloseAck ", StringComparison.OrdinalIgnoreCase) ||
+                   trimmed.StartsWith("<SignalAck ", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string? ExtractPsGuidFromLine(string line)
+        {
+            int idx = line.IndexOf("PSGuid='", StringComparison.OrdinalIgnoreCase);
+            char quote = '\'';
+            if (idx < 0)
             {
-                for (int i = 0; i < _deferredStdoutLines.Count; i++)
-                {
-                    string candidate = _deferredStdoutLines[i];
-                    if (predicate == null || predicate(candidate))
-                    {
-                        _deferredStdoutLines.RemoveAt(i);
-                        line = candidate;
-                        return true;
-                    }
-                }
+                idx = line.IndexOf("PSGuid=\"", StringComparison.OrdinalIgnoreCase);
+                quote = '"';
             }
 
-            line = null;
-            return false;
+            if (idx < 0)
+                return null;
+
+            int start = idx + 8;
+            int end = line.IndexOf(quote, start);
+            return end > start ? line.Substring(start, end - start) : null;
         }
 
         private void ReadStdout()
@@ -147,7 +137,26 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 {
                     string? line = _process.StandardOutput.ReadLine();
                     if (line == null) break;
-                    try { _stdoutQueue.Add(line); }
+
+                    string trimmed = line.Trim();
+                    if (string.IsNullOrEmpty(trimmed))
+                        continue;
+
+                    if (IsAckPacket(trimmed))
+                    {
+                        _ackEvent.Set();
+                        continue;
+                    }
+
+                    if (!trimmed.StartsWith("<Data ", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    string? lineCommandId = ExtractPsGuidFromLine(trimmed);
+                    bool isSessionLine = string.IsNullOrEmpty(lineCommandId) ||
+                        string.Equals(lineCommandId, Guid.Empty.ToString(), StringComparison.OrdinalIgnoreCase);
+
+                    var targetQueue = isSessionLine ? _sessionStdoutQueue : _commandStdoutQueue;
+                    try { targetQueue.Add(trimmed); }
                     catch (InvalidOperationException) { break; }
                 }
             }
@@ -155,7 +164,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
             catch (ObjectDisposedException) { }
             finally
             {
-                try { _stdoutQueue.CompleteAdding(); } catch { }
+                try { _sessionStdoutQueue.CompleteAdding(); } catch { }
+                try { _commandStdoutQueue.CompleteAdding(); } catch { }
+                try { _ackEvent.Set(); } catch { }
             }
         }
 
@@ -179,7 +190,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
             if (_disposed) return;
             _disposed = true;
 
-            try { _stdoutQueue.CompleteAdding(); } catch { }
+            try { _sessionStdoutQueue.CompleteAdding(); } catch { }
+            try { _commandStdoutQueue.CompleteAdding(); } catch { }
+            try { _ackEvent.Set(); } catch { }
 
             if (_process != null)
             {
@@ -199,7 +212,9 @@ namespace AwakeCoding.PSRemoting.PowerShell
                 }
             }
 
-            _stdoutQueue.Dispose();
+            _sessionStdoutQueue.Dispose();
+            _commandStdoutQueue.Dispose();
+            _ackEvent.Dispose();
         }
     }
 
@@ -611,7 +626,8 @@ namespace AwakeCoding.PSRemoting.PowerShell
             // The client retries immediately on an empty response; a short timeout keeps
             // latency low without busy-looping on the server side.
             string? requestedCommandId = ParseCommandIdFromReceiveRequest(soapXml);
-            string? firstLine = shell.TryDequeueStdoutLine(timeoutMs: 500, predicate: line => MatchesRequestedCommand(line, requestedCommandId, shell.CurrentCommandPipelineGuid));
+            bool isCommandStream = !string.IsNullOrWhiteSpace(requestedCommandId);
+            string? firstLine = shell.TryDequeueStdoutLine(timeoutMs: 500, isCommandStream: isCommandStream);
 
             var lines = new System.Collections.Generic.List<string>();
             if (firstLine != null)
@@ -620,11 +636,11 @@ namespace AwakeCoding.PSRemoting.PowerShell
 
                 // Drain any additional immediately-available lines (non-blocking)
                 string? extraLine;
-                while ((extraLine = shell.TryDequeueStdoutLine(0, predicate: line => MatchesRequestedCommand(line, requestedCommandId, shell.CurrentCommandPipelineGuid))) != null)
+                while ((extraLine = shell.TryDequeueStdoutLine(0, isCommandStream: isCommandStream)) != null)
                     lines.Add(extraLine);
             }
 
-            return BuildReceiveResponse(shellId, lines);
+            return BuildReceiveResponse(requestedCommandId ?? shellId, lines);
         }
 
         private string HandleDelete(string soapXml)
@@ -689,10 +705,19 @@ namespace AwakeCoding.PSRemoting.PowerShell
             }
         }
 
-        private static string HandleSignal(string soapXml)
+        private string HandleSignal(string soapXml)
         {
-            // Signal is sent to terminate a running command. We treat it as a no-op
-            // since our server's command lifecycle is tied to the shell (Delete handles cleanup).
+            string? shellId = ParseShellIdFromRequest(soapXml);
+            if (shellId != null && _shells.TryGetValue(shellId, out var shell))
+            {
+                string? cmdGuid = shell.CurrentCommandPipelineGuid;
+                if (!string.IsNullOrWhiteSpace(cmdGuid))
+                {
+                    shell.CurrentCommandPipelineGuid = null;
+                    shell.WriteToStdin($"<Close PSGuid='{cmdGuid}' />");
+                }
+            }
+
             return BuildSignalResponse();
         }
 
@@ -743,39 +768,6 @@ namespace AwakeCoding.PSRemoting.PowerShell
             {
                 return null;
             }
-        }
-
-        private static bool MatchesRequestedCommand(string line, string? requestedCommandId, string? currentCommandPipelineGuid)
-        {
-            string? lineCommandId = ExtractPsGuidFromOutputLine(line);
-            if (string.IsNullOrWhiteSpace(requestedCommandId))
-            {
-                return string.IsNullOrWhiteSpace(lineCommandId) ||
-                    string.Equals(lineCommandId, Guid.Empty.ToString(), StringComparison.OrdinalIgnoreCase);
-            }
-
-            string expectedGuid = !string.IsNullOrWhiteSpace(currentCommandPipelineGuid)
-                ? currentCommandPipelineGuid
-                : requestedCommandId;
-            return string.Equals(lineCommandId, expectedGuid, StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static string? ExtractPsGuidFromOutputLine(string line)
-        {
-            int idx = line.IndexOf("PSGuid='", StringComparison.OrdinalIgnoreCase);
-            char quote = '\'';
-            if (idx < 0)
-            {
-                idx = line.IndexOf("PSGuid=\"", StringComparison.OrdinalIgnoreCase);
-                quote = '"';
-            }
-
-            if (idx < 0)
-                return null;
-
-            int start = idx + 8;
-            int end = line.IndexOf(quote, start);
-            return end > start ? line.Substring(start, end - start) : null;
         }
 
         private static void SendHttpResponse(

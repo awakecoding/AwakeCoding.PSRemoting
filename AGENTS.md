@@ -45,6 +45,8 @@ This is a **hybrid .NET/PowerShell module** that provides PowerShell remoting ca
 - [`src/PSHostTcpServerTransport.cs`](src/PSHostTcpServerTransport.cs) - Internal TCP transport connection info and manager (server-side)
 - [`src/PSHostGrpcPlatform.cs`](src/PSHostGrpcPlatform.cs) - gRPC platform support guard
 - [`src/Protos/psrp.proto`](src/Protos/psrp.proto) - gRPC transport service contract
+- [`src/ProtoSerialization.cs`](src/ProtoSerialization.cs) & [`src/CborSerialization.cs`](src/CborSerialization.cs) - Protobuf and CBOR `PSObject` serializers/deserializers
+- [`src/PSObjectSerializationCommands.cs`](src/PSObjectSerializationCommands.cs) - Unified `*-PSObject` cmdlets with `-Format <Protobuf|Cbor|Clixml>` and format auto-detection
 - [`src/WinRMSspiAuth.cs`](src/WinRMSspiAuth.cs) - WinRM SSPI authentication helpers
 - [`src/AwakeCoding.PSRemoting.psd1`](src/AwakeCoding.PSRemoting.psd1) - Module manifest
 
